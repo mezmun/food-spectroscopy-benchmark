@@ -1,13 +1,13 @@
-# Data folder
+# Dataset files
 
-Datasets are not distributed in this repository.
+Place the following source files in this directory. The data themselves are not redistributed by this repository.
 
-Place the required files in this folder before running `benchmark.py`.
+| File | Tasks used by the benchmark |
+|---|---|
+| `mangos_TA_Vit_C.xlsx` | Mango-A titratable acidity; Mango-A vitamin C |
+| `Cucurbitaceae_Fruits.xlsx` | Cucurbitaceae water content; Cucurbitaceae soluble solids/Brix |
+| `milk.csv` | Milk fat |
+| `Mangoes.xlsx` | Mango-B titratable acidity; vitamin C; Brix |
+| `DATASET.csv` | Grape berry sugar |
 
-Expected file names:
-- mangos_TA_Vit_C.xlsx
-- Cucurbitaceae_Fruits.xlsx
-- milk.csv
-- Mangoes.xlsx
-- DATASET.csv
-- Cary_centrifuged_Brix_averaged.xlsx
+The row and column slices are defined in `manuscript_datasets()` in `benchmark.py`. The program validates that a target column does not overlap the predictor slice and also checks whether any predictor exactly reproduces the target.

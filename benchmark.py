@@ -1,1755 +1,1711 @@
 # -*- coding: utf-8 -*-
 """
-Spectroscopy Benchmark (Regression): Chemometrics vs Simple ANN / 1D-CNN
+Food NIR spectroscopy regression benchmark.
 
-Nested evaluation + learning curve analysis for comparative benchmarking.
+The pipeline provides two complementary evaluation tracks:
 
-OUTPUT STRUCTURE
-========================
-For each dataset:
-  outputs/<dataset_name>/
-    tables/   -> each table is saved as a separate .xlsx
-    figures/  -> .png figures
+1. Leakage-safe nested cross-validation on the complete dataset, preserving the
+   original benchmark design for repeated model-selection/performance estimation.
+2. A fixed independent hold-out test set. Hyperparameter selection is performed
+   only on the development subset, and the locked test subset is used only for
+   final prediction assessment and test-based learning curves.
 
-Tables:
-  - bench_raw.xlsx
-  - bench_summary.xlsx
-  - best_config_freq.xlsx
-  - run_log.xlsx
-  - learning_curve_selected_config.xlsx
-  - learning_curve_raw.xlsx
-  - learning_curve_agg.xlsx
-  - learning_curve_summary.xlsx
-  - dl_complexity.xlsx
+The script compares PLSR, Ridge, SVR, ANN, and 1D-CNN models and exports raw
+predictions, summary tables, paired randomization tests, learning curves,
+complexity analyses, publication figures, CSV files, Excel workbooks, and LaTeX
+code for quantitative manuscript tables.
 
-Figures:
-  - bench_rmse_bar_<dataset>.png
-  - bench_r2_bar_<dataset>.png
-  - bench_rmse_box_<dataset>.png
-  - bench_rmse_r2_scatter_<dataset>.png
-  - learning_curve_train_cv_panels_<dataset>.png
-  - dl_complexity_rmse_panels_<dataset>.png
+Datasets are not distributed with this repository. Use --synthetic for a fully
+self-contained simulation and --smoke-test for a fast end-to-end check.
 """
 
-import os
+from __future__ import annotations
+
+import argparse
 import gc
+import json
+import math
 import random
-import ast
-from dataclasses import dataclass, field
-from typing import Dict, Any, List, Tuple, Optional
-
-import numpy as np
-import pandas as pd
-
-from sklearn.model_selection import KFold
-from sklearn.preprocessing import StandardScaler
-from sklearn.cross_decomposition import PLSRegression
-from sklearn.svm import SVR
-from sklearn.linear_model import Ridge
-from sklearn.metrics import r2_score, mean_squared_error
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from sklearn.cross_decomposition import PLSRegression
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.model_selection import KFold, train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVR
 
-import tensorflow as tf
-from tensorflow.keras import layers, models, callbacks, optimizers
+try:
+    import tensorflow as tf
+    from tensorflow.keras import callbacks, layers, models, optimizers
+    TF_AVAILABLE = True
+except Exception:
+    tf = None
+    callbacks = layers = models = optimizers = None
+    TF_AVAILABLE = False
+
+MODEL_ORDER = ["PLSR", "Ridge", "SVR", "ANN", "CNN1D"]
+TASK_ORDER = [
+    "Mango-A (TA)",
+    "Mango-A (Vitamin C)",
+    "Cucurbitaceae (Water)",
+    "Cucurbitaceae (Brix)",
+    "Milk (Fat)",
+    "Mango-B (TA)",
+    "Mango-B (Vitamin C)",
+    "Mango-B (Brix)",
+    "Grapes (Sugar)",
+]
 
 
-# =========================================================
-# 0) Basic helpers
-# =========================================================
-
-def set_seed(seed: int):
+def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
-    tf.random.set_seed(seed)
+    if TF_AVAILABLE:
+        tf.random.set_seed(seed)
 
 
-def rmse(y_true, y_pred) -> float:
+def safe_clear_tf() -> None:
+    if TF_AVAILABLE:
+        tf.keras.backend.clear_session()
+
+
+def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
 
-def safe_clear_tf():
-    tf.keras.backend.clear_session()
+def sample_std(values: Sequence[float]) -> float:
+    x = np.asarray(values, dtype=float)
+    return 0.0 if x.size <= 1 else float(np.std(x, ddof=1))
 
 
-def build_early_stopping(
-    patience: int = 30, monitor: str = "val_rmse"
-) -> callbacks.Callback:
-    return callbacks.EarlyStopping(
-        monitor=monitor, mode="min", patience=patience, restore_best_weights=True
-    )
+def safe_slug(text: str) -> str:
+    out = []
+    for ch in text.lower():
+        out.append(ch if ch.isalnum() else "_")
+    s = "".join(out)
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s.strip("_")
 
 
-def build_reduce_lr(monitor: str = "val_rmse") -> callbacks.Callback:
-    return callbacks.ReduceLROnPlateau(
-        monitor=monitor,
-        mode="min",
-        factor=0.5,
-        patience=10,
-        min_lr=1e-6,
-        verbose=0,
-    )
+def reorder_tasks(df: pd.DataFrame, task_col: str = "task") -> pd.DataFrame:
+    if df.empty or task_col not in df.columns:
+        return df
+    order = {name: i for i, name in enumerate(TASK_ORDER)}
+    out = df.copy()
+    out["__order"] = out[task_col].map(order).fillna(10_000)
+    out = out.sort_values(["__order"]).drop(columns="__order").reset_index(drop=True)
+    return out
 
 
-def _median(x: List[float]) -> float:
-    return float(np.median(np.array(x, dtype=float)))
+def reorder_models(df: pd.DataFrame, model_col: str = "family") -> pd.DataFrame:
+    if df.empty or model_col not in df.columns:
+        return df
+    order = {name: i for i, name in enumerate(MODEL_ORDER)}
+    out = df.copy()
+    out["__order"] = out[model_col].map(order).fillna(10_000)
+    out = out.sort_values(["__order"]).drop(columns="__order").reset_index(drop=True)
+    return out
 
 
-def _mean(x: List[float]) -> float:
-    return float(np.mean(np.array(x, dtype=float)))
-
-
-def _std(x: List[float]) -> float:
-    x = np.array(x, dtype=float)
-    if x.size <= 1:
-        return 0.0
-    return float(np.std(x, ddof=1))
-
-
-# =========================================================
-# 1) Dataset loading (Excel / CSV)
-# =========================================================
-
-@dataclass
+@dataclass(frozen=True)
 class DatasetConfig:
-    name: str
-    kind: str  # "excel" or "csv"
+    task: str
+    kind: str
     path: str
-    satir_ilk: int
-    satir_son: int
-    bas_sutun: int
-    bit_sutun: int
-    col_Y: int
-    sep: str = ","  # csv only
+    row_start: int
+    row_stop: int
+    feature_start: int
+    feature_stop: int
+    target_col: int
+    sep: str = ","
+    target_unit: str = ""
+    spectral_range: str = ""
+    expected_n: Optional[int] = None
+    expected_p: Optional[int] = None
 
 
-def load_dataset(cfg: DatasetConfig) -> Tuple[np.ndarray, np.ndarray]:
-    if cfg.kind.lower() == "excel":
-        df = pd.read_excel(cfg.path, engine="openpyxl", header=None)
-        data = df.values
-    elif cfg.kind.lower() == "csv":
-        df = pd.read_csv(cfg.path, sep=cfg.sep)
-        data = df.values
+def manuscript_datasets() -> List[DatasetConfig]:
+    return [
+        DatasetConfig("Mango-A (TA)", "excel", "data/mangos_TA_Vit_C.xlsx", 1, 59, 4, 1560, 2,
+                      target_unit="mg/100gr FM", spectral_range="999.9-2500.2 nm", expected_n=58, expected_p=1556),
+        DatasetConfig("Mango-A (Vitamin C)", "excel", "data/mangos_TA_Vit_C.xlsx", 1, 59, 4, 1560, 3,
+                      target_unit="mg/100gr FM", spectral_range="999.9-2500.2 nm", expected_n=58, expected_p=1556),
+        DatasetConfig("Cucurbitaceae (Water)", "excel", "data/Cucurbitaceae_Fruits.xlsx", 1, 301, 3, 232, 2,
+                      target_unit="%", spectral_range="381-1065 nm", expected_n=300, expected_p=229),
+        DatasetConfig("Cucurbitaceae (Brix)", "excel", "data/Cucurbitaceae_Fruits.xlsx", 1, 301, 3, 232, 1,
+                      target_unit="% Brix", spectral_range="381-1065 nm", expected_n=300, expected_p=229),
+        DatasetConfig("Milk (Fat)", "csv", "data/milk.csv", 0, 1224, 270, 526, 1, sep=",",
+                      target_unit="%", spectral_range="960-1690 nm", expected_n=1224, expected_p=256),
+        DatasetConfig("Mango-B (TA)", "excel", "data/Mangoes.xlsx", 1, 187, 5, 1561, 3,
+                      target_unit="mg/100g", spectral_range="999.9-2500.2 nm", expected_n=186, expected_p=1556),
+        DatasetConfig("Mango-B (Vitamin C)", "excel", "data/Mangoes.xlsx", 1, 187, 5, 1561, 2,
+                      target_unit="mg/100g", spectral_range="999.9-2500.2 nm", expected_n=186, expected_p=1556),
+        DatasetConfig("Mango-B (Brix)", "excel", "data/Mangoes.xlsx", 1, 187, 5, 1561, 4,
+                      target_unit="deg Brix", spectral_range="999.9-2500.2 nm", expected_n=186, expected_p=1556),
+        DatasetConfig("Grapes (Sugar)", "csv", "data/DATASET.csv", 0, 75, 3, 206, 2, sep=";",
+                      target_unit="g/L", spectral_range="397.32-1003.5 nm", expected_n=75, expected_p=203),
+    ]
+
+
+def validate_column_definition(cfg: DatasetConfig) -> None:
+    if cfg.feature_start <= cfg.target_col < cfg.feature_stop:
+        raise ValueError(
+            f"Target leakage in {cfg.task}: target_col={cfg.target_col} lies inside "
+            f"feature slice [{cfg.feature_start}:{cfg.feature_stop})."
+        )
+    if cfg.row_stop <= cfg.row_start or cfg.feature_stop <= cfg.feature_start:
+        raise ValueError(f"Invalid slice definition for {cfg.task}.")
+
+
+def load_dataset(cfg: DatasetConfig, repo_root: Path) -> Tuple[np.ndarray, np.ndarray]:
+    validate_column_definition(cfg)
+    path = repo_root / cfg.path
+    if not path.exists():
+        raise FileNotFoundError(f"Required dataset file not found: {path}")
+    if cfg.kind == "excel":
+        df = pd.read_excel(path, engine="openpyxl", header=None)
+    elif cfg.kind == "csv":
+        df = pd.read_csv(path, sep=cfg.sep)
     else:
-        raise ValueError(f"Unknown kind: {cfg.kind}")
-
-    y = data[cfg.satir_ilk:cfg.satir_son, cfg.col_Y].astype("float32").ravel()
-    X = data[
-        cfg.satir_ilk:cfg.satir_son, cfg.bas_sutun:cfg.bit_sutun
-    ].astype("float32")
+        raise ValueError(f"Unknown dataset kind: {cfg.kind}")
+    data = df.values
+    if cfg.row_stop > data.shape[0] or max(cfg.feature_stop - 1, cfg.target_col) >= data.shape[1]:
+        raise ValueError(f"Configured slice exceeds file dimensions for {cfg.task}: shape={data.shape}.")
+    y = data[cfg.row_start:cfg.row_stop, cfg.target_col].astype("float32").ravel()
+    X = data[cfg.row_start:cfg.row_stop, cfg.feature_start:cfg.feature_stop].astype("float32")
     return X, y
 
 
-# =========================================================
-# 2) Preprocess (leakage-safe)
-# =========================================================
-
-@dataclass
-class PreprocessConfig:
-    use_autoscale: bool = True  # StandardScaler
-
-
-def preprocess_fit_apply(
-    X_tr_raw: np.ndarray,
-    X_other_raw_list: List[np.ndarray],
-    cfg: PreprocessConfig,
-):
-    X_tr = X_tr_raw.copy()
-    X_others = [Xo.copy() for Xo in X_other_raw_list]
-
-    scaler = None
-    if cfg.use_autoscale:
-        scaler = StandardScaler(with_mean=True, with_std=True)
-        X_tr = scaler.fit_transform(X_tr)
-        X_others = [scaler.transform(Xo) for Xo in X_others]
-
-    return X_tr, X_others, scaler
-
-
-def y_fit_apply(y_tr: np.ndarray, y_other_list: List[np.ndarray]):
-    """
-    Fold-safe y scaling for DL stability.
-    Train y is scaled; predictions are inverse-transformed for reporting
-    RMSE/R2 in original units.
-    """
-    ys = StandardScaler(with_mean=True, with_std=True)
-    y_tr_s = ys.fit_transform(y_tr.reshape(-1, 1)).ravel()
-    y_others_s = [ys.transform(y.reshape(-1, 1)).ravel() for y in y_other_list]
-    return y_tr_s, y_others_s, ys
+def synthetic_dataset(cfg: DatasetConfig, seed: int) -> Tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    n = min(max(54, cfg.expected_n or 72), 90)
+    p = 64
+    latent = rng.normal(size=(n, 6))
+    X = latent @ rng.normal(size=(6, p)) + 0.20 * rng.normal(size=(n, p))
+    X = (np.roll(X, 1, axis=1) + 2 * X + np.roll(X, -1, axis=1)) / 4.0
+    difficulty = {
+        "Mango-A (TA)": 0.35,
+        "Mango-A (Vitamin C)": 0.75,
+        "Cucurbitaceae (Water)": 0.30,
+        "Cucurbitaceae (Brix)": 0.45,
+        "Milk (Fat)": 0.25,
+        "Mango-B (TA)": 1.20,
+        "Mango-B (Vitamin C)": 0.90,
+        "Mango-B (Brix)": 1.10,
+        "Grapes (Sugar)": 0.70,
+    }.get(cfg.task, 0.70)
+    beta = rng.normal(size=p) * np.exp(-np.linspace(0, 2.5, p))
+    signal = X @ beta
+    nonlinear = 0.12 * latent[:, 0] ** 2 - 0.08 * latent[:, 1] * latent[:, 2]
+    y = signal + nonlinear + difficulty * np.std(signal) * rng.normal(size=n)
+    return X.astype("float32"), y.astype("float32")
 
 
-# =========================================================
-# 3) Models
-# =========================================================
-
-def build_mlp(
-    input_len: int, units: List[int], dropout: float = 0.3
-) -> tf.keras.Model:
-    inp = layers.Input(shape=(input_len,), name="mlp_input")
-    x = inp
-    for u in units:
-        x = layers.Dense(u, activation="relu")(x)
-        if dropout and dropout > 0:
-            x = layers.Dropout(dropout)(x)
-    out = layers.Dense(1, activation="linear")(x)
-    model = models.Model(inp, out, name=f"MLP_{'-'.join(map(str, units))}")
-    model.compile(
-        optimizer=optimizers.Adam(learning_rate=1e-3, clipnorm=1.0),
-        loss="mse",
-        metrics=[tf.keras.metrics.RootMeanSquaredError(name="rmse")],
-    )
-    return model
-
-
-def build_cnn1d(
-    input_len: int,
-    filters: List[int],
-    kernel_size: int,
-    dropout: float = 0.2,
-    use_layernorm: bool = True,
-) -> tf.keras.Model:
-    inp = layers.Input(shape=(input_len, 1), name="cnn_input")
-    x = inp
-    for f in filters:
-        x = layers.Conv1D(filters=f, kernel_size=kernel_size, padding="same")(x)
-        if use_layernorm:
-            x = layers.LayerNormalization()(x)
-        x = layers.ReLU()(x)
-        if dropout and dropout > 0:
-            x = layers.Dropout(dropout)(x)
-    x = layers.GlobalAveragePooling1D()(x)
-    out = layers.Dense(1, activation="linear")(x)
-    model = models.Model(
-        inp, out, name=f"CNN1D_{'-'.join(map(str, filters))}_k{kernel_size}"
-    )
-    model.compile(
-        optimizer=optimizers.Adam(learning_rate=1e-3, clipnorm=1.0),
-        loss="mse",
-        metrics=[tf.keras.metrics.RootMeanSquaredError(name="rmse")],
-    )
-    return model
-
-
-def fit_predict_plsr(X_tr, y_tr, X_te, n_comp: int):
-    m = PLSRegression(n_components=n_comp)
-    m.fit(X_tr, y_tr)
-    return m.predict(X_te).ravel(), m
-
-
-def fit_predict_svr(X_tr, y_tr, X_te, C: float, gamma="scale", epsilon=0.1):
-    m = SVR(kernel="rbf", C=C, gamma=gamma, epsilon=epsilon)
-    m.fit(X_tr, y_tr)
-    return m.predict(X_te).ravel(), m
-
-
-def fit_predict_ridge(X_tr, y_tr, X_te, alpha: float):
-    m = Ridge(alpha=alpha)
-    m.fit(X_tr, y_tr)
-    return m.predict(X_te).ravel(), m
-
-
-# =========================================================
-# 3b) Complexity helpers (ANN / CNN1D)
-# =========================================================
-
-VERIFY_COMPLEXITY_WITH_KERAS = True
-_DL_COMPLEXITY_CACHE: Dict[Tuple, Tuple[int, int]] = {}
-
-
-def _safe_literal_eval(s: str):
-    try:
-        return ast.literal_eval(s)
-    except Exception:
-        return None
-
-
-def ann_param_count_analytic(input_len: int, units: List[int]) -> int:
-    prev = int(input_len)
-    total = 0
-    for u in units:
-        u = int(u)
-        total += (prev + 1) * u
-        prev = u
-    total += (prev + 1) * 1
-    return int(total)
-
-
-def cnn1d_param_count_analytic(
-    input_len: int,
-    filters: List[int],
-    kernel_size: int,
-    use_layernorm: bool = True,
-) -> int:
-    k = int(kernel_size)
-    in_ch = 1
-    total = 0
-    for f in filters:
-        f = int(f)
-        total += (k * in_ch + 1) * f
-        if use_layernorm:
-            total += 2 * f
-        in_ch = f
-    total += (in_ch + 1) * 1
-    return int(total)
-
-
-def ann_flops_approx(input_len: int, units: List[int]) -> int:
-    prev = int(input_len)
-    flops = 0
-    for u in units:
-        u = int(u)
-        flops += 2 * prev * u
-        prev = u
-    flops += 2 * prev * 1
-    return int(flops)
-
-
-def cnn1d_flops_approx(input_len: int, filters: List[int], kernel_size: int) -> int:
-    L = int(input_len)
-    k = int(kernel_size)
-    in_ch = 1
-    flops = 0
-    for f in filters:
-        f = int(f)
-        flops += L * 2 * (k * in_ch * f)
-        in_ch = f
-    flops += 2 * in_ch * 1
-    return int(flops)
-
-
-def dl_complexity_cached(
-    fam: str, cand: Dict[str, Any], input_len: int
-) -> Tuple[int, int]:
-    """
-    Returns:
-      param_count (verified with Keras if enabled),
-      approx_flops (theoretical, per forward pass).
-    """
-    cand_str = str(cand)
-
-    if fam == "ANN":
-        key = ("ANN", int(input_len), cand_str, float(MODEL_REGISTRY["ANN"]["dropout"]))
-        if key in _DL_COMPLEXITY_CACHE:
-            return _DL_COMPLEXITY_CACHE[key]
-
-        params_a = ann_param_count_analytic(input_len, cand["units"])
-        flops_a = ann_flops_approx(input_len, cand["units"])
-        params_final = params_a
-
-        if VERIFY_COMPLEXITY_WITH_KERAS:
-            try:
-                safe_clear_tf()
-                m = build_mlp(
-                    input_len=input_len,
-                    units=cand["units"],
-                    dropout=MODEL_REGISTRY["ANN"]["dropout"],
-                )
-                params_k = int(m.count_params())
-                if params_k != params_a:
-                    print(
-                        f"[WARN] ANN param mismatch analytic={params_a} "
-                        f"vs keras={params_k} | cand={cand}"
-                    )
-                    params_final = params_k
-            except Exception as e:
-                print(f"[WARN] ANN keras param verify failed: {e} | cand={cand}")
-
-        _DL_COMPLEXITY_CACHE[key] = (int(params_final), int(flops_a))
-        return _DL_COMPLEXITY_CACHE[key]
-
-    if fam == "CNN1D":
-        key = (
-            "CNN1D",
-            int(input_len),
-            cand_str,
-            float(MODEL_REGISTRY["CNN1D"]["dropout"]),
-            bool(MODEL_REGISTRY["CNN1D"]["use_layernorm"]),
-        )
-        if key in _DL_COMPLEXITY_CACHE:
-            return _DL_COMPLEXITY_CACHE[key]
-
-        params_a = cnn1d_param_count_analytic(
-            input_len=input_len,
-            filters=cand["filters"],
-            kernel_size=cand["kernel"],
-            use_layernorm=MODEL_REGISTRY["CNN1D"]["use_layernorm"],
-        )
-        flops_a = cnn1d_flops_approx(input_len, cand["filters"], cand["kernel"])
-        params_final = params_a
-
-        if VERIFY_COMPLEXITY_WITH_KERAS:
-            try:
-                safe_clear_tf()
-                m = build_cnn1d(
-                    input_len=input_len,
-                    filters=cand["filters"],
-                    kernel_size=cand["kernel"],
-                    dropout=MODEL_REGISTRY["CNN1D"]["dropout"],
-                    use_layernorm=MODEL_REGISTRY["CNN1D"]["use_layernorm"],
-                )
-                params_k = int(m.count_params())
-                if params_k != params_a:
-                    print(
-                        f"[WARN] CNN1D param mismatch analytic={params_a} "
-                        f"vs keras={params_k} | cand={cand}"
-                    )
-                    params_final = params_k
-            except Exception as e:
-                print(f"[WARN] CNN1D keras param verify failed: {e} | cand={cand}")
-
-        _DL_COMPLEXITY_CACHE[key] = (int(params_final), int(flops_a))
-        return _DL_COMPLEXITY_CACHE[key]
-
-    return (None, None)
-
-
-def save_multi_table_xlsx(path: str, sheets: Dict[str, pd.DataFrame]):
-    with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        for name, df in sheets.items():
-            df.to_excel(writer, sheet_name=name[:31], index=False)
-
-
-def build_dl_complexity_tables(
-    dataset_name: str,
-    bench_df: pd.DataFrame,
-    candlog_df: pd.DataFrame,
-    input_len: int,
-) -> Dict[str, pd.DataFrame]:
-    inner_raw = candlog_df.copy()
-
-    g = inner_raw.groupby(["dataset", "family", "cand_str"], as_index=False)
-    inner_agg = g.agg(
-        param_count=("param_count", "first"),
-        approx_flops=("approx_flops", "first"),
-        inner_cv_rmse_mean=("inner_cv_rmse", "mean"),
-        inner_cv_rmse_std=("inner_cv_rmse", "std"),
-        n_outer=("outer_fold", "nunique"),
-    )
-    inner_agg["inner_cv_rmse_std"] = inner_agg["inner_cv_rmse_std"].fillna(0.0)
-
-    dl_best = bench_df[bench_df["family"].isin(["ANN", "CNN1D"])].copy()
-    params_list, flops_list = [], []
-    for s in dl_best["best_cand"].astype(str).tolist():
-        cand = _safe_literal_eval(s)
-        if isinstance(cand, dict):
-            fam = "ANN" if "units" in cand else "CNN1D"
-            pcount, aflops = dl_complexity_cached(fam, cand, input_len=input_len)
-            params_list.append(pcount)
-            flops_list.append(aflops)
-        else:
-            params_list.append(None)
-            flops_list.append(None)
-    dl_best["param_count"] = params_list
-    dl_best["approx_flops"] = flops_list
-
+def audit_dataset(X: np.ndarray, y: np.ndarray, cfg: DatasetConfig, synthetic: bool) -> Dict[str, Any]:
+    validate_column_definition(cfg)
+    if X.ndim != 2 or y.ndim != 1 or len(X) != len(y):
+        raise ValueError(f"{cfg.task}: inconsistent X/y dimensions.")
+    if not np.isfinite(X).all() or not np.isfinite(y).all():
+        raise ValueError(f"{cfg.task}: non-finite values detected.")
+    if np.std(y) == 0:
+        raise ValueError(f"{cfg.task}: constant target.")
+    exact_matches = sum(np.allclose(X[:, j], y, rtol=0.0, atol=1e-10) for j in range(X.shape[1]))
+    if exact_matches:
+        raise ValueError(f"{cfg.task}: a predictor exactly reproduces the target; check column mapping.")
+    _, inv, counts = np.unique(X, axis=0, return_inverse=True, return_counts=True)
+    dup_rows = int(np.sum(np.maximum(counts - 1, 0)))
+    conflict = 0
+    for gid in np.where(counts > 1)[0]:
+        if np.ptp(y[inv == gid]) > 1e-8:
+            conflict += 1
+    n, p = X.shape
     return {
-        "inner_candidates_raw": inner_raw,
-        "inner_candidates_agg": inner_agg.sort_values(
-            ["family", "param_count"], ascending=[True, True]
-        ),
-        "outer_best": dl_best,
+        "task": cfg.task, "file": cfg.path, "N": n, "p": p, "N_over_p": n / p,
+        "target_unit": cfg.target_unit, "spectral_range": cfg.spectral_range,
+        "target_min": float(y.min()), "target_max": float(y.max()),
+        "target_mean": float(y.mean()), "target_sd": float(np.std(y, ddof=1)),
+        "duplicate_spectra_rows": dup_rows,
+        "duplicate_spectra_conflicting_target_groups": conflict,
+        "exact_target_feature_matches": exact_matches,
+        "expected_N": cfg.expected_n, "expected_p": cfg.expected_p,
+        "expected_N_match": None if synthetic or cfg.expected_n is None else bool(n == cfg.expected_n),
+        "expected_p_match": None if synthetic or cfg.expected_p is None else bool(p == cfg.expected_p),
     }
 
 
-def fig_dl_complexity_rmse_panels(
-    inner_agg_df: pd.DataFrame, out_dir_figs: str, dataset_name: str
-):
-    sf = inner_agg_df[inner_agg_df["dataset"] == dataset_name].copy()
-    ann = sf[sf["family"] == "ANN"].dropna(subset=["param_count"])
-    cnn = sf[sf["family"] == "CNN1D"].dropna(subset=["param_count"])
-
-    if ann.empty and cnn.empty:
-        return
-
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
-    ax1, ax2 = axes
-
-    if not ann.empty:
-        ann = ann.sort_values("param_count")
-        ax1.errorbar(
-            ann["param_count"],
-            ann["inner_cv_rmse_mean"],
-            yerr=ann["inner_cv_rmse_std"],
-            fmt="o",
-        )
-        ax1.set_xscale("log")
-        ax1.set_title(f"{dataset_name} | ANN | Complexity vs RMSE (Inner-CV)")
-        ax1.set_xlabel("Param count (log)")
-        ax1.set_ylabel("Inner-CV RMSE (mean±std across outer folds)")
-        ax1.grid(True, alpha=0.25)
-    else:
-        ax1.set_axis_off()
-
-    if not cnn.empty:
-        cnn = cnn.sort_values("param_count")
-        ax2.errorbar(
-            cnn["param_count"],
-            cnn["inner_cv_rmse_mean"],
-            yerr=cnn["inner_cv_rmse_std"],
-            fmt="o",
-        )
-        ax2.set_xscale("log")
-        ax2.set_title(f"{dataset_name} | CNN1D | Complexity vs RMSE (Inner-CV)")
-        ax2.set_xlabel("Param count (log)")
-        ax2.set_ylabel("Inner-CV RMSE (mean±std across outer folds)")
-        ax2.grid(True, alpha=0.25)
-    else:
-        ax2.set_axis_off()
-
-    plt.tight_layout()
-    path = os.path.join(out_dir_figs, f"dl_complexity_rmse_panels_{dataset_name}.png")
-    plt.savefig(path, dpi=200)
-    plt.close(fig)
+def make_locked_holdout_split(n: int, test_fraction: float, seed: int) -> Tuple[np.ndarray, np.ndarray]:
+    dev, test = train_test_split(np.arange(n), test_size=test_fraction, random_state=seed, shuffle=True)
+    return np.sort(dev), np.sort(test)
 
 
-# =========================================================
-# 4) Model Registry
-# =========================================================
+@dataclass
+class PreprocessConfig:
+    use_autoscale: bool = True
+
+
+def preprocess_fit_apply(X_train_raw: np.ndarray, X_others_raw: Sequence[np.ndarray], cfg: PreprocessConfig):
+    Xtr = X_train_raw.copy()
+    others = [x.copy() for x in X_others_raw]
+    scaler = None
+    if cfg.use_autoscale:
+        scaler = StandardScaler()
+        Xtr = scaler.fit_transform(Xtr)
+        others = [scaler.transform(x) for x in others]
+    return Xtr, others, scaler
+
+
+def fit_y_scaler(y: np.ndarray) -> StandardScaler:
+    s = StandardScaler()
+    s.fit(y.reshape(-1, 1))
+    return s
+
 
 MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
-    "PLSR": {
-        "enabled": True,
-        "candidates": [{"n_comp": n} for n in [5, 10, 15, 20, 25, 30]],
-    },
-    "SVR": {
-        "enabled": True,
-        "candidates": [
-            {"C": C, "gamma": "scale", "epsilon": 0.1}
-            for C in [0.3, 1, 3, 10, 30, 100]
-        ],
-    },
-    "Ridge": {
-        "enabled": True,
-        "candidates": [{"alpha": a} for a in [1e-4, 1e-3, 1e-2, 1e-1, 1, 10]],
-    },
-    "ANN": {
-        "enabled": True,
-        "candidates": [
-            {"units": [8]},
-            {"units": [12]},
-            {"units": [16]},
-            {"units": [24]},
-            {"units": [32]},
-            {"units": [48]},
-            {"units": [64]},
-            {"units": [16, 8]},
-            {"units": [32, 16]},
-            {"units": [64, 32]},
-            {"units": [96, 48]},
-            {"units": [128, 64]},
-        ],
-        "dropout": 0.3,
-    },
-    "CNN1D": {
-        "enabled": True,
-        "candidates": [
-            {"filters": [8], "kernel": 3},
-            {"filters": [16], "kernel": 3},
-            {"filters": [32], "kernel": 3},
-            {"filters": [8], "kernel": 5},
-            {"filters": [16], "kernel": 5},
-            {"filters": [32], "kernel": 5},
-            {"filters": [16], "kernel": 7},
-            {"filters": [32], "kernel": 7},
-            {"filters": [16, 8], "kernel": 3},
-            {"filters": [32, 16], "kernel": 3},
-            {"filters": [16, 8], "kernel": 5},
-            {"filters": [32, 16], "kernel": 5},
-        ],
-        "dropout": 0.2,
-        "use_layernorm": True,
-    },
+    "PLSR": {"enabled": True, "candidates": [{"n_comp": n} for n in [5, 10, 15, 20, 25, 30]]},
+    "Ridge": {"enabled": True, "candidates": [{"alpha": a} for a in [1e-4, 1e-3, 1e-2, 1e-1, 1, 10]]},
+    "SVR": {"enabled": True, "candidates": [{"C": c, "gamma": "scale", "epsilon": 0.1} for c in [0.3, 1, 3, 10, 30, 100]]},
+    "ANN": {"enabled": True, "candidates": [{"units": u} for u in [[8], [12], [16], [24], [32], [48], [64], [16,8], [32,16], [64,32], [96,48], [128,64]]], "dropout": 0.3},
+    "CNN1D": {"enabled": True, "candidates": [
+        {"filters":[8],"kernel":3},{"filters":[16],"kernel":3},{"filters":[32],"kernel":3},
+        {"filters":[8],"kernel":5},{"filters":[16],"kernel":5},{"filters":[32],"kernel":5},
+        {"filters":[16],"kernel":7},{"filters":[32],"kernel":7},
+        {"filters":[16,8],"kernel":3},{"filters":[32,16],"kernel":3},
+        {"filters":[16,8],"kernel":5},{"filters":[32,16],"kernel":5}],
+        "dropout":0.2, "use_layernorm":True},
 }
 
 
-def is_dl_family(fam: str) -> bool:
-    return fam in ["ANN", "CNN1D"]
+def is_dl_family(family: str) -> bool:
+    return family in {"ANN", "CNN1D"}
 
 
-# =========================================================
-# 5) Experiment Config
-# =========================================================
+def build_mlp(input_len: int, units: List[int], dropout: float):
+    if not TF_AVAILABLE:
+        raise RuntimeError("TensorFlow is required for ANN/CNN1D models.")
+    inp = layers.Input(shape=(input_len,))
+    x = inp
+    for u in units:
+        x = layers.Dense(u, activation="relu")(x)
+        if dropout > 0:
+            x = layers.Dropout(dropout)(x)
+    out = layers.Dense(1)(x)
+    m = models.Model(inp, out)
+    m.compile(optimizer=optimizers.Adam(learning_rate=1e-3, clipnorm=1.0), loss="mse",
+              metrics=[tf.keras.metrics.RootMeanSquaredError(name="rmse")])
+    return m
+
+
+def build_cnn1d(input_len: int, filters: List[int], kernel: int, dropout: float, use_layernorm: bool):
+    if not TF_AVAILABLE:
+        raise RuntimeError("TensorFlow is required for ANN/CNN1D models.")
+    inp = layers.Input(shape=(input_len, 1))
+    x = inp
+    for f in filters:
+        x = layers.Conv1D(f, kernel, padding="same")(x)
+        if use_layernorm:
+            x = layers.LayerNormalization()(x)
+        x = layers.ReLU()(x)
+        if dropout > 0:
+            x = layers.Dropout(dropout)(x)
+    x = layers.GlobalAveragePooling1D()(x)
+    out = layers.Dense(1)(x)
+    m = models.Model(inp, out)
+    m.compile(optimizer=optimizers.Adam(learning_rate=1e-3, clipnorm=1.0), loss="mse",
+              metrics=[tf.keras.metrics.RootMeanSquaredError(name="rmse")])
+    return m
+
+
+def build_callbacks(patience: int):
+    return [callbacks.EarlyStopping(monitor="val_rmse", mode="min", patience=patience, restore_best_weights=True),
+            callbacks.ReduceLROnPlateau(monitor="val_rmse", mode="min", factor=0.5, patience=10, min_lr=1e-6, verbose=0)]
+
+
+def fit_classical_model(family: str, cand: Dict[str, Any], X: np.ndarray, y: np.ndarray):
+    if family == "PLSR":
+        m = PLSRegression(n_components=int(cand["n_comp"]), scale=False)
+    elif family == "Ridge":
+        m = Ridge(alpha=float(cand["alpha"]))
+    elif family == "SVR":
+        m = SVR(kernel="rbf", C=float(cand["C"]), gamma=cand["gamma"], epsilon=float(cand["epsilon"]))
+    else:
+        raise ValueError(f"Unsupported family: {family}")
+    m.fit(X, y)
+    return m
+
+
+def complexity_for_candidate(family: str, cand: Dict[str, Any], input_len: int):
+    if family == "ANN":
+        prev, params, flops = input_len, 0, 0
+        for u in cand["units"]:
+            params += (prev + 1) * u; flops += 2 * prev * u; prev = u
+        params += prev + 1; flops += 2 * prev
+        return int(params), int(flops)
+    if family == "CNN1D":
+        in_ch, params, flops = 1, 0, 0
+        for f in cand["filters"]:
+            params += (cand["kernel"] * in_ch + 1) * f
+            if MODEL_REGISTRY["CNN1D"]["use_layernorm"]:
+                params += 2 * f
+            flops += input_len * 2 * cand["kernel"] * in_ch * f
+            in_ch = f
+        params += in_ch + 1; flops += 2 * in_ch
+        return int(params), int(flops)
+    return None, None
+
 
 @dataclass
 class ExperimentConfig:
     outer_folds: int = 3
     inner_folds: int = 3
-
-    dl_seeds_inner: List[int] = None
-    dl_seeds_final: List[int] = None
-
     epochs: int = 400
     batch_size: int = 16
     patience: int = 30
-
+    dl_seeds_inner: List[int] = field(default_factory=lambda: [0, 1])
+    dl_seeds_final: List[int] = field(default_factory=lambda: [0, 1])
+    dl_validation_fraction: float = 0.15
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
-
-    run_learning_curve: bool = True
+    holdout_fraction: float = 0.20
+    holdout_seed: int = 2026
+    run_learning_curves: bool = True
     learning_curve_points: int = 10
-    lc_families: List[str] = None
-    lc_seed: int = 0
-    lc_select_seed: int = 0
-
-    lc_cv_folds: int = 3
-    lc_repeats: int = 2
-    lc_repeat_seeds: List[int] = None
-
-    dl_validation_split: float = 0.15
-
-
-def default_cfg() -> ExperimentConfig:
-    cfg = ExperimentConfig()
-    cfg.dl_seeds_inner = [0, 1]
-    cfg.dl_seeds_final = [0, 1]
-    cfg.lc_families = ["PLSR", "ANN", "CNN1D"]
-    cfg.lc_repeat_seeds = [0, 1]
-    return cfg
+    learning_curve_families: List[str] = field(default_factory=lambda: ["PLSR", "ANN", "CNN1D"])
+    learning_curve_repeats: int = 2
+    learning_curve_cv_folds: int = 3
+    learning_curve_seed: int = 700
+    randomization_trials: int = 9999
+    randomization_seed: int = 2026
+    output_root: str = "outputs/revision_results"
+    disable_dl: bool = False
+    synthetic: bool = False
+    smoke_test: bool = False
 
 
-# =========================================================
-# 6) Output dirs per dataset + saving tables
-# =========================================================
-
-def ensure_dataset_dirs(dataset_name: str) -> Dict[str, str]:
-    if dataset_name is None or dataset_name.strip() == "":
-        raise ValueError(
-            "dataset_name is empty/blank. Refusing to create outputs/ "
-            "without dataset folder."
-        )
-    base = os.path.join("outputs", dataset_name)
-    tables = os.path.join(base, "tables")
-    figs = os.path.join(base, "figures")
-    os.makedirs(tables, exist_ok=True)
-    os.makedirs(figs, exist_ok=True)
-    return {"base": base, "tables": tables, "figs": figs}
+def active_families(cfg: ExperimentConfig) -> List[str]:
+    fams = [f for f in MODEL_ORDER if MODEL_REGISTRY[f]["enabled"]]
+    if cfg.disable_dl:
+        fams = [f for f in fams if not is_dl_family(f)]
+    if any(is_dl_family(f) for f in fams) and not TF_AVAILABLE:
+        raise RuntimeError("TensorFlow is not available. Install requirements or use --disable-dl for a classical-model test.")
+    return fams
 
 
-def save_table_xlsx(path: str, df: pd.DataFrame, sheet_name: str = "data"):
-    with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name=sheet_name, index=False)
+def apply_smoke_profile(cfg: ExperimentConfig) -> None:
+    cfg.outer_folds = 2; cfg.inner_folds = 2; cfg.epochs = 8; cfg.patience = 2
+    cfg.dl_seeds_inner = [0]; cfg.dl_seeds_final = [0]
+    cfg.learning_curve_points = 3; cfg.learning_curve_repeats = 1; cfg.learning_curve_cv_folds = 2
+    cfg.randomization_trials = 199
+    MODEL_REGISTRY["PLSR"]["candidates"] = [{"n_comp":2},{"n_comp":4}]
+    MODEL_REGISTRY["Ridge"]["candidates"] = [{"alpha":0.1},{"alpha":1.0}]
+    MODEL_REGISTRY["SVR"]["candidates"] = [{"C":1.0,"gamma":"scale","epsilon":0.1},{"C":10.0,"gamma":"scale","epsilon":0.1}]
+    MODEL_REGISTRY["ANN"]["candidates"] = [{"units":[8]},{"units":[16]}]
+    MODEL_REGISTRY["CNN1D"]["candidates"] = [{"filters":[8],"kernel":3},{"filters":[8],"kernel":5}]
 
-
-# =========================================================
-# 7) Progress accounting (total fits + remaining) + log to Excel
-# =========================================================
 
 class FitProgress:
-    def __init__(self, total_fits: int):
-        self.total = int(total_fits)
-        self.done = 0
-        self.records: List[Dict[str, Any]] = []
-
+    def __init__(self): self.done = 0; self.records: List[Dict[str, Any]] = []
     def step(self, msg: str):
-        self.done += 1
-        left = self.total - self.done
-        line = f"[FIT {self.done}/{self.total} | left={left}] {msg}"
-        print(line)
-        self.records.append(
-            {
-                "fit_done": self.done,
-                "fit_total": self.total,
-                "left": left,
-                "message": msg,
-            }
-        )
+        self.done += 1; print(f"[FIT {self.done}] {msg}"); self.records.append({"fit":self.done,"message":msg})
+    def to_dataframe(self): return pd.DataFrame(self.records)
 
-    def to_dataframe(self) -> pd.DataFrame:
-        return pd.DataFrame(self.records)
-
-
-def estimate_total_fits_for_dataset(
-    cfg: ExperimentConfig, families: List[str], do_lc: bool
-) -> int:
-    total = 0
-
-    for _ in range(cfg.outer_folds):
-        for fam in families:
-            cands = len(MODEL_REGISTRY[fam]["candidates"])
-            if is_dl_family(fam):
-                total += cands * cfg.inner_folds * len(cfg.dl_seeds_inner)
-                total += len(cfg.dl_seeds_final)
-            else:
-                total += cands * cfg.inner_folds
-                total += 1
-
-    if do_lc:
-        points = cfg.learning_curve_points
-        lc_fams = [f for f in cfg.lc_families if f in families]
-        for fam in lc_fams:
-            cands = len(MODEL_REGISTRY[fam]["candidates"])
-            if is_dl_family(fam):
-                total += cands * cfg.inner_folds * 1
-            else:
-                total += cands * cfg.inner_folds
-            total += points * cfg.lc_repeats * cfg.lc_cv_folds
-
-    return int(total)
-
-
-# =========================================================
-# 8) Inner CV selection (3-fold)
-# =========================================================
 
 def kfold_splits(n: int, n_splits: int, seed: int):
-    kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    return list(kf.split(np.arange(n)))
+    return list(KFold(n_splits=n_splits, shuffle=True, random_state=seed).split(np.arange(n)))
 
 
-def one_line_cand(fam: str, cand: Dict[str, Any]) -> str:
-    return f"{fam} cand={cand}"
+def candidate_valid_for_splits(family: str, cand: Dict[str, Any], splits, n_features: int) -> bool:
+    if family != "PLSR": return True
+    max_comp = min(n_features, min(len(tr) for tr, _ in splits) - 1)
+    return cand["n_comp"] <= max_comp
 
 
-def eval_candidate_sklearn_cv(
-    fam: str,
-    cand: Dict[str, Any],
-    X_tr_raw: np.ndarray,
-    y_tr: np.ndarray,
-    cfg: ExperimentConfig,
-    cv_splits,
-    dataset_name: str,
-    outer_fold_i: int,
-    progress: FitProgress,
-    stage: str,
-) -> float:
+def eval_candidate_classical_cv(family, cand, X, y, splits, cfg, task, stage, progress):
     scores = []
-    for fold_i, (tr_idx, va_idx) in enumerate(cv_splits, start=1):
-        X_in_tr_raw, y_in_tr = X_tr_raw[tr_idx], y_tr[tr_idx]
-        X_in_va_raw, y_in_va = X_tr_raw[va_idx], y_tr[va_idx]
-
-        X_in_tr, [X_in_va], _ = preprocess_fit_apply(
-            X_in_tr_raw, [X_in_va_raw], cfg.preprocess
-        )
-
-        if fam == "PLSR":
-            yhat, _ = fit_predict_plsr(X_in_tr, y_in_tr, X_in_va, cand["n_comp"])
-        elif fam == "SVR":
-            yhat, _ = fit_predict_svr(
-                X_in_tr, y_in_tr, X_in_va, cand["C"], cand["gamma"], cand["epsilon"]
-            )
-        elif fam == "Ridge":
-            yhat, _ = fit_predict_ridge(X_in_tr, y_in_tr, X_in_va, cand["alpha"])
-        else:
-            raise ValueError(f"Unknown sklearn family: {fam}")
-
-        scores.append(rmse(y_in_va, yhat))
-
-        progress.step(
-            f"DS={dataset_name} | outer={outer_fold_i}/{cfg.outer_folds} | {stage}"
-            f" | inner_fold={fold_i}/{cfg.inner_folds} | {one_line_cand(fam, cand)}"
-        )
-
+    for fold, (tr, va) in enumerate(splits, 1):
+        Xtr, [Xva], _ = preprocess_fit_apply(X[tr], [X[va]], cfg.preprocess)
+        m = fit_classical_model(family, cand, Xtr, y[tr]); pred = np.asarray(m.predict(Xva)).ravel()
+        scores.append(rmse(y[va], pred)); progress.step(f"{task} | {stage} | {family} | fold={fold} | {cand}")
     return float(np.mean(scores))
 
 
-def eval_candidate_dl_cv(
-    fam: str,
-    cand: Dict[str, Any],
-    X_tr_raw: np.ndarray,
-    y_tr: np.ndarray,
-    cfg: ExperimentConfig,
-    cv_splits,
-    input_len: int,
-    seeds: List[int],
-    dataset_name: str,
-    outer_fold_i: int,
-    progress: FitProgress,
-    stage: str,
-) -> float:
+def eval_candidate_dl_cv(family, cand, X, y, splits, cfg, task, stage, progress):
     seed_scores = []
-    for s in seeds:
+    for seed in cfg.dl_seeds_inner:
         fold_scores = []
-        for fold_i, (tr_idx, va_idx) in enumerate(cv_splits, start=1):
-            set_seed(s)
-            safe_clear_tf()
-
-            X_in_tr_raw, y_in_tr = X_tr_raw[tr_idx], y_tr[tr_idx]
-            X_in_va_raw, y_in_va = X_tr_raw[va_idx], y_tr[va_idx]
-
-            X_in_tr, [X_in_va], _ = preprocess_fit_apply(
-                X_in_tr_raw, [X_in_va_raw], cfg.preprocess
-            )
-
-            y_in_tr_s, [y_in_va_s], ysc = y_fit_apply(y_in_tr, [y_in_va])
-
-            es = build_early_stopping(patience=cfg.patience, monitor="val_rmse")
-            rlrop = build_reduce_lr(monitor="val_rmse")
-
-            if fam == "ANN":
-                model = build_mlp(
-                    input_len=input_len,
-                    units=cand["units"],
-                    dropout=MODEL_REGISTRY["ANN"]["dropout"],
-                )
-                Xtr_in, Xva_in = X_in_tr, X_in_va
-            elif fam == "CNN1D":
-                model = build_cnn1d(
-                    input_len=input_len,
-                    filters=cand["filters"],
-                    kernel_size=cand["kernel"],
-                    dropout=MODEL_REGISTRY["CNN1D"]["dropout"],
-                    use_layernorm=MODEL_REGISTRY["CNN1D"]["use_layernorm"],
-                )
-                Xtr_in, Xva_in = X_in_tr[..., None], X_in_va[..., None]
+        for fold, (tr, va) in enumerate(splits, 1):
+            set_seed(seed); safe_clear_tf()
+            Xtr, [Xva], _ = preprocess_fit_apply(X[tr], [X[va]], cfg.preprocess)
+            ys = fit_y_scaler(y[tr]); ytr_s = ys.transform(y[tr].reshape(-1,1)).ravel(); yva_s = ys.transform(y[va].reshape(-1,1)).ravel()
+            if family == "ANN":
+                m = build_mlp(Xtr.shape[1], cand["units"], MODEL_REGISTRY["ANN"]["dropout"]); Xtr_i, Xva_i = Xtr, Xva
             else:
-                raise ValueError(f"Unknown DL family: {fam}")
-
-            model.fit(
-                Xtr_in,
-                y_in_tr_s,
-                validation_data=(Xva_in, y_in_va_s),
-                epochs=cfg.epochs,
-                batch_size=cfg.batch_size,
-                callbacks=[es, rlrop],
-                verbose=0,
-            )
-
-            yhat_s = model.predict(Xva_in, verbose=0).ravel()
-            yhat = ysc.inverse_transform(yhat_s.reshape(-1, 1)).ravel()
-            fold_scores.append(rmse(y_in_va, yhat))
-
-            progress.step(
-                f"DS={dataset_name} | outer={outer_fold_i}/{cfg.outer_folds} | {stage}"
-                f" | seed={s} | inner_fold={fold_i}/{cfg.inner_folds} | "
-                f"{one_line_cand(fam, cand)}"
-            )
-
+                m = build_cnn1d(Xtr.shape[1], cand["filters"], cand["kernel"], MODEL_REGISTRY["CNN1D"]["dropout"], MODEL_REGISTRY["CNN1D"]["use_layernorm"]); Xtr_i, Xva_i = Xtr[...,None], Xva[...,None]
+            m.fit(Xtr_i, ytr_s, validation_data=(Xva_i,yva_s), epochs=cfg.epochs, batch_size=cfg.batch_size, callbacks=build_callbacks(cfg.patience), verbose=0)
+            pred_s = m.predict(Xva_i, verbose=0).ravel(); pred = ys.inverse_transform(pred_s.reshape(-1,1)).ravel()
+            fold_scores.append(rmse(y[va], pred)); progress.step(f"{task} | {stage} | {family} | seed={seed} | fold={fold} | {cand}")
         seed_scores.append(float(np.mean(fold_scores)))
-
-    return _median(seed_scores)
-
-
-def select_best_config_inner(
-    fam: str,
-    X_tr_raw: np.ndarray,
-    y_tr: np.ndarray,
-    cfg: ExperimentConfig,
-    input_len: int,
-    inner_seed: int,
-    dataset_name: str,
-    outer_fold_i: int,
-    progress: FitProgress,
-    cand_log_rows: Optional[List[Dict[str, Any]]] = None,
-) -> Tuple[Dict[str, Any], float]:
-    cv_splits = kfold_splits(len(X_tr_raw), cfg.inner_folds, seed=inner_seed)
-    candidates = MODEL_REGISTRY[fam]["candidates"]
-
-    best_cand, best_score = None, None
-    for cand in candidates:
-        if is_dl_family(fam):
-            score = eval_candidate_dl_cv(
-                fam=fam,
-                cand=cand,
-                X_tr_raw=X_tr_raw,
-                y_tr=y_tr,
-                cfg=cfg,
-                cv_splits=cv_splits,
-                input_len=input_len,
-                seeds=cfg.dl_seeds_inner,
-                dataset_name=dataset_name,
-                outer_fold_i=outer_fold_i,
-                progress=progress,
-                stage="INNER_SELECT",
-            )
-        else:
-            score = eval_candidate_sklearn_cv(
-                fam=fam,
-                cand=cand,
-                X_tr_raw=X_tr_raw,
-                y_tr=y_tr,
-                cfg=cfg,
-                cv_splits=cv_splits,
-                dataset_name=dataset_name,
-                outer_fold_i=outer_fold_i,
-                progress=progress,
-                stage="INNER_SELECT",
-            )
-
-        if cand_log_rows is not None:
-            pcount, aflops = (None, None)
-            if is_dl_family(fam):
-                pcount, aflops = dl_complexity_cached(fam, cand, input_len=input_len)
-
-            cand_log_rows.append(
-                {
-                    "dataset": dataset_name,
-                    "outer_fold": int(outer_fold_i),
-                    "family": fam,
-                    "cand_str": str(cand),
-                    "param_count": pcount,
-                    "approx_flops": aflops,
-                    "inner_cv_rmse": float(score),
-                    "inner_seed": int(inner_seed),
-                }
-            )
-
-        if best_score is None or score < best_score:
-            best_score = score
-            best_cand = cand
-
-    return best_cand, float(best_score)
+    return float(np.median(seed_scores))
 
 
-# =========================================================
-# 9) Final fit on outer train, eval on outer test
-# =========================================================
-
-def fit_and_eval_on_outer_test(
-    fam: str,
-    best_cand: Dict[str, Any],
-    X_tr_raw: np.ndarray,
-    y_tr: np.ndarray,
-    X_te_raw: np.ndarray,
-    y_te: np.ndarray,
-    cfg: ExperimentConfig,
-    input_len: int,
-    dataset_name: str,
-    outer_fold_i: int,
-    progress: FitProgress,
-) -> Dict[str, Any]:
-    X_tr, [X_te], _ = preprocess_fit_apply(X_tr_raw, [X_te_raw], cfg.preprocess)
-
-    if is_dl_family(fam):
-        test_rmses, test_r2s = [], []
-        for s in cfg.dl_seeds_final:
-            set_seed(1000 + s + outer_fold_i)
-            safe_clear_tf()
-
-            y_tr_s, [y_te_s], ysc = y_fit_apply(y_tr, [y_te])
-
-            es = build_early_stopping(patience=cfg.patience, monitor="val_rmse")
-            rlrop = build_reduce_lr(monitor="val_rmse")
-
-            if fam == "ANN":
-                model = build_mlp(
-                    input_len=input_len,
-                    units=best_cand["units"],
-                    dropout=MODEL_REGISTRY["ANN"]["dropout"],
-                )
-                Xtr_in, Xte_in = X_tr, X_te
-            else:
-                model = build_cnn1d(
-                    input_len=input_len,
-                    filters=best_cand["filters"],
-                    kernel_size=best_cand["kernel"],
-                    dropout=MODEL_REGISTRY["CNN1D"]["dropout"],
-                    use_layernorm=MODEL_REGISTRY["CNN1D"]["use_layernorm"],
-                )
-                Xtr_in, Xte_in = X_tr[..., None], X_te[..., None]
-
-            model.fit(
-                Xtr_in,
-                y_tr_s,
-                validation_split=cfg.dl_validation_split,
-                epochs=cfg.epochs,
-                batch_size=cfg.batch_size,
-                callbacks=[es, rlrop],
-                verbose=0,
-            )
-
-            yhat_s = model.predict(Xte_in, verbose=0).ravel()
-            yhat = ysc.inverse_transform(yhat_s.reshape(-1, 1)).ravel()
-
-            test_rmses.append(rmse(y_te, yhat))
-            test_r2s.append(float(r2_score(y_te, yhat)))
-
-            progress.step(
-                f"DS={dataset_name} | outer={outer_fold_i}/{cfg.outer_folds} | "
-                f"FINAL_EVAL | seed={s} | {one_line_cand(fam, best_cand)}"
-            )
-
-        return {
-            "family": fam,
-            "best_cand": str(best_cand),
-            "test_rmse_median": _median(test_rmses),
-            "test_rmse_mean": _mean(test_rmses),
-            "test_rmse_std": _std(test_rmses),
-            "test_r2_median": _median(test_r2s),
-            "test_r2_mean": _mean(test_r2s),
-            "test_r2_std": _std(test_r2s),
-        }
-
-    else:
-        if fam == "PLSR":
-            yhat, _ = fit_predict_plsr(X_tr, y_tr, X_te, best_cand["n_comp"])
-        elif fam == "SVR":
-            yhat, _ = fit_predict_svr(
-                X_tr,
-                y_tr,
-                X_te,
-                best_cand["C"],
-                best_cand["gamma"],
-                best_cand["epsilon"],
-            )
-        elif fam == "Ridge":
-            yhat, _ = fit_predict_ridge(X_tr, y_tr, X_te, best_cand["alpha"])
-        else:
-            raise ValueError(f"Unknown family: {fam}")
-
-        progress.step(
-            f"DS={dataset_name} | outer={outer_fold_i}/{cfg.outer_folds} | "
-            f"FINAL_EVAL | {one_line_cand(fam, best_cand)}"
-        )
-
-        r = rmse(y_te, yhat)
-        r2 = float(r2_score(y_te, yhat))
-        return {
-            "family": fam,
-            "best_cand": str(best_cand),
-            "test_rmse_median": r,
-            "test_rmse_mean": r,
-            "test_rmse_std": 0.0,
-            "test_r2_median": r2,
-            "test_r2_mean": r2,
-            "test_r2_std": 0.0,
-        }
+def select_best_config(family, X, y, cfg, seed, task, stage, progress):
+    splits = kfold_splits(len(X), cfg.inner_folds, seed)
+    rows, best_cand, best_score = [], None, math.inf
+    for cand in MODEL_REGISTRY[family]["candidates"]:
+        params, flops = complexity_for_candidate(family, cand, X.shape[1])
+        if not candidate_valid_for_splits(family, cand, splits, X.shape[1]):
+            rows.append({"task":task,"stage":stage,"family":family,"candidate":str(cand),"inner_cv_rmse":np.nan,"param_count":params,"approx_flops":flops,"status":"skipped_invalid_for_fold_size"}); continue
+        score = eval_candidate_dl_cv(family,cand,X,y,splits,cfg,task,stage,progress) if is_dl_family(family) else eval_candidate_classical_cv(family,cand,X,y,splits,cfg,task,stage,progress)
+        rows.append({"task":task,"stage":stage,"family":family,"candidate":str(cand),"inner_cv_rmse":score,"param_count":params,"approx_flops":flops,"status":"evaluated"})
+        if score < best_score: best_score, best_cand = score, dict(cand)
+    if best_cand is None: raise RuntimeError(f"No valid candidate for {task}/{family}.")
+    return best_cand, float(best_score), rows
 
 
-# =========================================================
-# 10) Benchmark runner (Outer 3-fold)
-# =========================================================
-
-def run_outer_cv_benchmark(
-    X: np.ndarray,
-    y: np.ndarray,
-    dataset_name: str,
-    cfg: ExperimentConfig,
-    progress: FitProgress,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    input_len = X.shape[1]
-
-    outer = KFold(n_splits=cfg.outer_folds, shuffle=True, random_state=42)
-    families = [k for k, v in MODEL_REGISTRY.items() if v.get("enabled", False)]
-
-    rows = []
-    cand_log_rows: List[Dict[str, Any]] = []
-    outer_i = 0
-
-    for tr_idx, te_idx in outer.split(np.arange(len(X))):
-        outer_i += 1
-        X_tr_raw, y_tr = X[tr_idx], y[tr_idx]
-        X_te_raw, y_te = X[te_idx], y[te_idx]
-
-        best_map: Dict[str, Tuple[Dict[str, Any], float]] = {}
-
-        for fam in families:
-            inner_seed = 100 + outer_i
-            best_cand, best_val = select_best_config_inner(
-                fam=fam,
-                X_tr_raw=X_tr_raw,
-                y_tr=y_tr,
-                cfg=cfg,
-                input_len=input_len,
-                inner_seed=inner_seed,
-                dataset_name=dataset_name,
-                outer_fold_i=outer_i,
-                progress=progress,
-                cand_log_rows=cand_log_rows,
-            )
-            best_map[fam] = (best_cand, best_val)
-
-        for fam in families:
-            best_cand, best_val = best_map[fam]
-            out = fit_and_eval_on_outer_test(
-                fam=fam,
-                best_cand=best_cand,
-                X_tr_raw=X_tr_raw,
-                y_tr=y_tr,
-                X_te_raw=X_te_raw,
-                y_te=y_te,
-                cfg=cfg,
-                input_len=input_len,
-                dataset_name=dataset_name,
-                outer_fold_i=outer_i,
-                progress=progress,
-            )
-            rows.append(
-                {
-                    "dataset": dataset_name,
-                    "outer_fold": outer_i,
-                    "family": fam,
-                    "inner_cv_rmse": float(best_val),
-                    "test_rmse_median": out["test_rmse_median"],
-                    "test_rmse_mean": out["test_rmse_mean"],
-                    "test_rmse_std": out["test_rmse_std"],
-                    "test_r2_median": out["test_r2_median"],
-                    "test_r2_mean": out["test_r2_mean"],
-                    "test_r2_std": out["test_r2_std"],
-                    "best_cand": out["best_cand"],
-                }
-            )
-
-        del X_tr_raw, y_tr, X_te_raw, y_te, best_map
-        gc.collect()
-        safe_clear_tf()
-
-    bench_df = pd.DataFrame(rows)
-    candlog_df = pd.DataFrame(cand_log_rows)
-    return bench_df, candlog_df
-
-
-def make_benchmark_summary(bench_df: pd.DataFrame) -> pd.DataFrame:
-    g = bench_df.groupby(["dataset", "family"])
-    out = g.agg(
-        rmse_mean=("test_rmse_median", "mean"),
-        rmse_std=("test_rmse_median", "std"),
-        r2_mean=("test_r2_median", "mean"),
-        r2_std=("test_r2_median", "std"),
-        n_folds=("test_rmse_median", "count"),
-    ).reset_index()
-    return out
-
-
-def best_config_frequencies(bench_df: pd.DataFrame) -> pd.DataFrame:
-    freq = (
-        bench_df.groupby(["dataset", "family", "best_cand"])
-        .size()
-        .reset_index(name="count")
-    )
-    freq = freq.sort_values(
-        ["dataset", "family", "count"], ascending=[True, True, False]
-    )
-    return freq
-
-
-# =========================================================
-# 11) Learning Curve (Train error + CV error)
-# =========================================================
-
-def select_best_config_for_lc_once(
-    fam: str,
-    X_raw: np.ndarray,
-    y: np.ndarray,
-    cfg: ExperimentConfig,
-    input_len: int,
-    dataset_name: str,
-    progress: FitProgress,
-) -> Tuple[Dict[str, Any], float]:
-    cv_splits = kfold_splits(len(X_raw), cfg.inner_folds, seed=777)
-    candidates = MODEL_REGISTRY[fam]["candidates"]
-
-    best_cand, best_score = None, None
-    for cand in candidates:
-        if is_dl_family(fam):
-            score = eval_candidate_dl_cv(
-                fam=fam,
-                cand=cand,
-                X_tr_raw=X_raw,
-                y_tr=y,
-                cfg=cfg,
-                cv_splits=cv_splits,
-                input_len=input_len,
-                seeds=[cfg.lc_select_seed],
-                dataset_name=dataset_name,
-                outer_fold_i=0,
-                progress=progress,
-                stage="LC_SELECT_ONCE",
-            )
-        else:
-            score = eval_candidate_sklearn_cv(
-                fam=fam,
-                cand=cand,
-                X_tr_raw=X_raw,
-                y_tr=y,
-                cfg=cfg,
-                cv_splits=cv_splits,
-                dataset_name=dataset_name,
-                outer_fold_i=0,
-                progress=progress,
-                stage="LC_SELECT_ONCE",
-            )
-
-        if best_score is None or score < best_score:
-            best_score = score
-            best_cand = cand
-
-    return best_cand, float(best_score)
-
-
-def _fit_predict_one_fold_for_lc(
-    fam: str,
+def fit_dl_predict_final(
+    family: str,
     cand: Dict[str, Any],
-    X_tr_raw: np.ndarray,
-    y_tr: np.ndarray,
-    X_va_raw: np.ndarray,
-    y_va: np.ndarray,
+    X_train_raw: np.ndarray,
+    y_train: np.ndarray,
+    X_test_raw: np.ndarray,
     cfg: ExperimentConfig,
-    input_len: int,
     seed: int,
-    dataset_name: str,
-    point_i: int,
-    repeat_i: int,
-    fold_i: int,
+    task: str,
+    stage: str,
     progress: FitProgress,
-) -> Dict[str, float]:
+) -> Tuple[np.ndarray, int]:
+    """Fit a DL model without using the final test set for stopping decisions.
+
+    An internal validation subset of the supplied training data is used only to
+    estimate a suitable training duration. The same architecture is then rebuilt
+    and refit on the complete training data for that number of epochs before
+    predictions are generated for the external evaluation subset.
     """
-    Returns train_rmse, val_rmse, train_r2, val_r2 in original y units.
-    """
-    X_tr, [X_va], _ = preprocess_fit_apply(X_tr_raw, [X_va_raw], cfg.preprocess)
+    set_seed(seed)
+    safe_clear_tf()
 
-    if fam == "PLSR":
-        yhat_tr, _ = fit_predict_plsr(X_tr, y_tr, X_tr, cand["n_comp"])
-        yhat_va, _ = fit_predict_plsr(X_tr, y_tr, X_va, cand["n_comp"])
-        progress.step(
-            f"DS={dataset_name} | LC_FIT point={point_i} rep={repeat_i} "
-            f"fold={fold_i} | {one_line_cand(fam, cand)}"
-        )
-        return {
-            "train_rmse": rmse(y_tr, yhat_tr),
-            "val_rmse": rmse(y_va, yhat_va),
-            "train_r2": float(r2_score(y_tr, yhat_tr)),
-            "val_r2": float(r2_score(y_va, yhat_va)),
-        }
+    indices = np.arange(len(X_train_raw))
+    tr_idx, va_idx = train_test_split(
+        indices,
+        test_size=cfg.dl_validation_fraction,
+        random_state=seed + 991,
+        shuffle=True,
+    )
 
-    if fam == "ANN":
-        set_seed(seed)
-        safe_clear_tf()
-        y_tr_s, [y_va_s], ysc = y_fit_apply(y_tr, [y_va])
+    X_sub, [X_val], _ = preprocess_fit_apply(
+        X_train_raw[tr_idx], [X_train_raw[va_idx]], cfg.preprocess
+    )
+    y_scaler = fit_y_scaler(y_train[tr_idx])
+    y_sub = y_scaler.transform(y_train[tr_idx].reshape(-1, 1)).ravel()
+    y_val = y_scaler.transform(y_train[va_idx].reshape(-1, 1)).ravel()
 
-        es = build_early_stopping(patience=cfg.patience, monitor="val_rmse")
-        rlrop = build_reduce_lr(monitor="val_rmse")
-
-        model = build_mlp(
-            input_len=input_len,
-            units=cand["units"],
-            dropout=MODEL_REGISTRY["ANN"]["dropout"],
-        )
-        model.fit(
-            X_tr,
-            y_tr_s,
-            validation_data=(X_va, y_va_s),
-            epochs=cfg.epochs,
-            batch_size=cfg.batch_size,
-            callbacks=[es, rlrop],
-            verbose=0,
-        )
-        yhat_tr_s = model.predict(X_tr, verbose=0).ravel()
-        yhat_va_s = model.predict(X_va, verbose=0).ravel()
-        yhat_tr = ysc.inverse_transform(yhat_tr_s.reshape(-1, 1)).ravel()
-        yhat_va = ysc.inverse_transform(yhat_va_s.reshape(-1, 1)).ravel()
-
-        progress.step(
-            f"DS={dataset_name} | LC_FIT point={point_i} rep={repeat_i} "
-            f"fold={fold_i} | seed={seed} | {one_line_cand(fam, cand)}"
-        )
-        return {
-            "train_rmse": rmse(y_tr, yhat_tr),
-            "val_rmse": rmse(y_va, yhat_va),
-            "train_r2": float(r2_score(y_tr, yhat_tr)),
-            "val_r2": float(r2_score(y_va, yhat_va)),
-        }
-
-    if fam == "CNN1D":
-        set_seed(seed)
-        safe_clear_tf()
-        y_tr_s, [y_va_s], ysc = y_fit_apply(y_tr, [y_va])
-
-        es = build_early_stopping(patience=cfg.patience, monitor="val_rmse")
-        rlrop = build_reduce_lr(monitor="val_rmse")
-
+    if family == "ANN":
+        model = build_mlp(X_sub.shape[1], cand["units"], MODEL_REGISTRY["ANN"]["dropout"])
+        X_sub_i, X_val_i = X_sub, X_val
+    elif family == "CNN1D":
         model = build_cnn1d(
-            input_len=input_len,
-            filters=cand["filters"],
-            kernel_size=cand["kernel"],
-            dropout=MODEL_REGISTRY["CNN1D"]["dropout"],
-            use_layernorm=MODEL_REGISTRY["CNN1D"]["use_layernorm"],
+            X_sub.shape[1],
+            cand["filters"],
+            cand["kernel"],
+            MODEL_REGISTRY["CNN1D"]["dropout"],
+            MODEL_REGISTRY["CNN1D"]["use_layernorm"],
         )
-        model.fit(
-            X_tr[..., None],
-            y_tr_s,
-            validation_data=(X_va[..., None], y_va_s),
-            epochs=cfg.epochs,
-            batch_size=cfg.batch_size,
-            callbacks=[es, rlrop],
-            verbose=0,
+        X_sub_i, X_val_i = X_sub[..., None], X_val[..., None]
+    else:
+        raise ValueError(f"Unsupported DL family: {family}")
+
+    history = model.fit(
+        X_sub_i,
+        y_sub,
+        validation_data=(X_val_i, y_val),
+        epochs=cfg.epochs,
+        batch_size=cfg.batch_size,
+        callbacks=build_callbacks(cfg.patience),
+        verbose=0,
+    )
+    val_curve = history.history.get("val_rmse", [])
+    best_epoch = int(np.argmin(val_curve) + 1) if val_curve else int(len(history.history.get("loss", [])))
+    best_epoch = max(1, min(best_epoch, cfg.epochs))
+    progress.step(f"{task} | {stage} | {family} | seed={seed} | epoch-selection")
+
+    # Refit on all available training samples. The external test set remains locked.
+    set_seed(seed)
+    safe_clear_tf()
+    X_full, [X_test], _ = preprocess_fit_apply(X_train_raw, [X_test_raw], cfg.preprocess)
+    y_scaler_full = fit_y_scaler(y_train)
+    y_full = y_scaler_full.transform(y_train.reshape(-1, 1)).ravel()
+
+    if family == "ANN":
+        final_model = build_mlp(X_full.shape[1], cand["units"], MODEL_REGISTRY["ANN"]["dropout"])
+        X_full_i, X_test_i = X_full, X_test
+    else:
+        final_model = build_cnn1d(
+            X_full.shape[1],
+            cand["filters"],
+            cand["kernel"],
+            MODEL_REGISTRY["CNN1D"]["dropout"],
+            MODEL_REGISTRY["CNN1D"]["use_layernorm"],
         )
-        yhat_tr_s = model.predict(X_tr[..., None], verbose=0).ravel()
-        yhat_va_s = model.predict(X_va[..., None], verbose=0).ravel()
-        yhat_tr = ysc.inverse_transform(yhat_tr_s.reshape(-1, 1)).ravel()
-        yhat_va = ysc.inverse_transform(yhat_va_s.reshape(-1, 1)).ravel()
+        X_full_i, X_test_i = X_full[..., None], X_test[..., None]
 
-        progress.step(
-            f"DS={dataset_name} | LC_FIT point={point_i} rep={repeat_i} "
-            f"fold={fold_i} | seed={seed} | {one_line_cand(fam, cand)}"
+    final_model.fit(
+        X_full_i,
+        y_full,
+        epochs=best_epoch,
+        batch_size=cfg.batch_size,
+        verbose=0,
+    )
+    pred_scaled = final_model.predict(X_test_i, verbose=0).ravel()
+    pred = y_scaler_full.inverse_transform(pred_scaled.reshape(-1, 1)).ravel()
+    progress.step(f"{task} | {stage} | {family} | seed={seed} | final-fit")
+    return pred.astype(float), best_epoch
+
+
+def evaluate_selected_model(
+    family: str,
+    cand: Dict[str, Any],
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    test_indices: np.ndarray,
+    cfg: ExperimentConfig,
+    task: str,
+    stage: str,
+    progress: FitProgress,
+    seed_override: Optional[Sequence[int]] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    metric_rows: List[Dict[str, Any]] = []
+    prediction_rows: List[Dict[str, Any]] = []
+
+    if is_dl_family(family):
+        seeds = list(seed_override) if seed_override is not None else list(cfg.dl_seeds_final)
+        for seed in seeds:
+            pred, best_epoch = fit_dl_predict_final(
+                family, cand, X_train, y_train, X_test, cfg, int(seed), task, stage, progress
+            )
+            metric_rows.append(
+                {
+                    "task": task,
+                    "stage": stage,
+                    "family": family,
+                    "seed": int(seed),
+                    "rmse": rmse(y_test, pred),
+                    "r2": float(r2_score(y_test, pred)),
+                    "best_epoch": int(best_epoch),
+                    "best_config": str(cand),
+                }
+            )
+            for sample_index, yt, yp in zip(test_indices, y_test, pred):
+                err = float(yt - yp)
+                prediction_rows.append(
+                    {
+                        "task": task,
+                        "stage": stage,
+                        "family": family,
+                        "seed": int(seed),
+                        "sample_index": int(sample_index),
+                        "y_true": float(yt),
+                        "y_pred": float(yp),
+                        "residual": err,
+                        "squared_error": err * err,
+                        "best_epoch": int(best_epoch),
+                        "best_config": str(cand),
+                    }
+                )
+    else:
+        Xtr, [Xte], _ = preprocess_fit_apply(X_train, [X_test], cfg.preprocess)
+        model = fit_classical_model(family, cand, Xtr, y_train)
+        pred = np.asarray(model.predict(Xte)).ravel().astype(float)
+        progress.step(f"{task} | {stage} | {family} | final-fit")
+        metric_rows.append(
+            {
+                "task": task,
+                "stage": stage,
+                "family": family,
+                "seed": np.nan,
+                "rmse": rmse(y_test, pred),
+                "r2": float(r2_score(y_test, pred)),
+                "best_epoch": np.nan,
+                "best_config": str(cand),
+            }
         )
-        return {
-            "train_rmse": rmse(y_tr, yhat_tr),
-            "val_rmse": rmse(y_va, yhat_va),
-            "train_r2": float(r2_score(y_tr, yhat_tr)),
-            "val_r2": float(r2_score(y_va, yhat_va)),
-        }
+        for sample_index, yt, yp in zip(test_indices, y_test, pred):
+            err = float(yt - yp)
+            prediction_rows.append(
+                {
+                    "task": task,
+                    "stage": stage,
+                    "family": family,
+                    "seed": np.nan,
+                    "sample_index": int(sample_index),
+                    "y_true": float(yt),
+                    "y_pred": float(yp),
+                    "residual": err,
+                    "squared_error": err * err,
+                    "best_epoch": np.nan,
+                    "best_config": str(cand),
+                }
+            )
 
-    raise ValueError(f"Unknown LC family: {fam}")
+    return pd.DataFrame(metric_rows), pd.DataFrame(prediction_rows)
 
 
-def run_learning_curve(
+def run_nested_cv(
     X: np.ndarray,
     y: np.ndarray,
-    dataset_name: str,
     cfg: ExperimentConfig,
+    task: str,
     progress: FitProgress,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    input_len = X.shape[1]
-    families = [f for f in cfg.lc_families if MODEL_REGISTRY.get(f, {}).get("enabled")]
+    raw_rows: List[Dict[str, Any]] = []
+    pred_frames: List[pd.DataFrame] = []
+    candidate_rows: List[Dict[str, Any]] = []
+    outer = KFold(n_splits=cfg.outer_folds, shuffle=True, random_state=42)
 
-    fracs = np.linspace(0.1, 1.0, cfg.learning_curve_points).tolist()
+    for outer_fold, (tr, te) in enumerate(outer.split(X), 1):
+        for family in active_families(cfg):
+            best, inner_score, rows = select_best_config(
+                family,
+                X[tr],
+                y[tr],
+                cfg,
+                seed=100 + outer_fold,
+                task=task,
+                stage=f"NESTED_OUTER_{outer_fold}_SELECT",
+                progress=progress,
+            )
+            for row in rows:
+                row["outer_fold"] = outer_fold
+                candidate_rows.append(row)
 
-    select_rows = []
-    lc_rows = []
+            metrics, predictions = evaluate_selected_model(
+                family,
+                best,
+                X[tr],
+                y[tr],
+                X[te],
+                y[te],
+                np.asarray(te),
+                cfg,
+                task,
+                stage=f"NESTED_OUTER_{outer_fold}_TEST",
+                progress=progress,
+            )
+            rmse_values = metrics["rmse"].astype(float).values
+            r2_values = metrics["r2"].astype(float).values
+            raw_rows.append(
+                {
+                    "task": task,
+                    "outer_fold": outer_fold,
+                    "family": family,
+                    "inner_cv_rmse": inner_score,
+                    "best_config": str(best),
+                    "test_rmse_mean": float(np.mean(rmse_values)),
+                    "test_rmse_median": float(np.median(rmse_values)),
+                    "test_rmse_sd_across_seeds": sample_std(rmse_values),
+                    "test_r2_mean": float(np.mean(r2_values)),
+                    "test_r2_median": float(np.median(r2_values)),
+                    "test_r2_sd_across_seeds": sample_std(r2_values),
+                    "n_test": int(len(te)),
+                    "n_final_seeds": int(len(metrics)),
+                }
+            )
+            predictions = predictions.copy()
+            predictions["outer_fold"] = outer_fold
+            pred_frames.append(predictions)
 
-    best_map = {}
-    for fam in families:
-        best_cand, best_cv_rmse = select_best_config_for_lc_once(
-            fam=fam,
-            X_raw=X,
-            y=y,
-            cfg=cfg,
-            input_len=input_len,
-            dataset_name=dataset_name,
+    return (
+        pd.DataFrame(raw_rows),
+        pd.concat(pred_frames, ignore_index=True) if pred_frames else pd.DataFrame(),
+        pd.DataFrame(candidate_rows),
+    )
+
+
+def summarize_nested_cv(raw: pd.DataFrame) -> pd.DataFrame:
+    if raw.empty:
+        return pd.DataFrame()
+    rows: List[Dict[str, Any]] = []
+    for (task, family), g in raw.groupby(["task", "family"], sort=False):
+        rm = g["test_rmse_median"].astype(float).values
+        rr = g["test_r2_median"].astype(float).values
+        rows.append(
+            {
+                "task": task,
+                "family": family,
+                "rmse_mean": float(np.mean(rm)),
+                "rmse_std": sample_std(rm),
+                "r2_mean": float(np.mean(rr)),
+                "r2_std": sample_std(rr),
+                "n_outer_folds": int(len(g)),
+            }
+        )
+    return reorder_models(reorder_tasks(pd.DataFrame(rows)))
+
+
+def aggregate_test_predictions(predictions: pd.DataFrame) -> pd.DataFrame:
+    if predictions.empty:
+        return pd.DataFrame()
+    rows: List[Dict[str, Any]] = []
+    keys = ["task", "stage", "sample_index", "family"]
+    for key, g in predictions.groupby(keys, sort=False, dropna=False):
+        yp = g["y_pred"].astype(float).values
+        se = g["squared_error"].astype(float).values
+        yt = float(g["y_true"].iloc[0])
+        yp_mean = float(np.mean(yp))
+        rows.append(
+            {
+                "task": key[0],
+                "stage": key[1],
+                "sample_index": int(key[2]),
+                "family": key[3],
+                "y_true": yt,
+                "y_pred_mean": yp_mean,
+                "y_pred_sd": sample_std(yp),
+                "squared_error_mean_across_seeds": float(np.mean(se)),
+                "squared_error_from_mean_prediction": float((yt - yp_mean) ** 2),
+                "n_prediction_seeds": int(len(g)),
+            }
+        )
+    return reorder_models(reorder_tasks(pd.DataFrame(rows)))
+
+
+def run_independent_test(
+    X: np.ndarray,
+    y: np.ndarray,
+    cfg: ExperimentConfig,
+    task: str,
+    progress: FitProgress,
+):
+    dev_idx, test_idx = make_locked_holdout_split(len(X), cfg.holdout_fraction, cfg.holdout_seed)
+    X_dev, y_dev = X[dev_idx], y[dev_idx]
+    X_test, y_test = X[test_idx], y[test_idx]
+
+    summary_rows: List[Dict[str, Any]] = []
+    seed_metric_frames: List[pd.DataFrame] = []
+    prediction_frames: List[pd.DataFrame] = []
+    candidate_rows: List[Dict[str, Any]] = []
+    best_map: Dict[str, Dict[str, Any]] = {}
+
+    for family in active_families(cfg):
+        best, inner_score, rows = select_best_config(
+            family,
+            X_dev,
+            y_dev,
+            cfg,
+            seed=cfg.holdout_seed + 17,
+            task=task,
+            stage="HOLDOUT_SELECT",
             progress=progress,
         )
-        best_map[fam] = best_cand
-        select_rows.append(
+        best_map[family] = best
+        candidate_rows.extend(rows)
+
+        metrics, predictions = evaluate_selected_model(
+            family,
+            best,
+            X_dev,
+            y_dev,
+            X_test,
+            y_test,
+            test_idx,
+            cfg,
+            task,
+            stage="LOCKED_TEST",
+            progress=progress,
+        )
+        metrics = metrics.copy()
+        metrics["inner_cv_rmse"] = inner_score
+        seed_metric_frames.append(metrics)
+        prediction_frames.append(predictions)
+
+    seed_metrics = pd.concat(seed_metric_frames, ignore_index=True) if seed_metric_frames else pd.DataFrame()
+    predictions = pd.concat(prediction_frames, ignore_index=True) if prediction_frames else pd.DataFrame()
+    pred_agg = aggregate_test_predictions(predictions)
+
+    for family in active_families(cfg):
+        g = seed_metrics[seed_metrics["family"] == family]
+        pg = pred_agg[pred_agg["family"] == family]
+        if g.empty or pg.empty:
+            continue
+        rmse_seed = g["rmse"].astype(float).values
+        r2_seed = g["r2"].astype(float).values
+        y_true = pg["y_true"].astype(float).values
+        y_pred_mean = pg["y_pred_mean"].astype(float).values
+        rmsep_pooled = float(np.sqrt(pg["squared_error_mean_across_seeds"].astype(float).mean()))
+        summary_rows.append(
             {
-                "dataset": dataset_name,
-                "family": fam,
-                "selected_best_cand": str(best_cand),
-                "inner_cv_rmse": float(best_cv_rmse),
-                "note": "Selected once on full data; fixed across LC points.",
+                "task": task,
+                "family": family,
+                "n_development": int(len(dev_idx)),
+                "n_test": int(len(test_idx)),
+                "inner_cv_rmse_selected": float(g["inner_cv_rmse"].iloc[0]),
+                "rmsep_pooled": rmsep_pooled,
+                "rmsep_mean_prediction": rmse(y_true, y_pred_mean),
+                "rmsep_seed_mean": float(np.mean(rmse_seed)),
+                "rmsep_seed_median": float(np.median(rmse_seed)),
+                "rmsep_seed_sd": sample_std(rmse_seed),
+                "r2_mean_prediction": float(r2_score(y_true, y_pred_mean)),
+                "r2_seed_mean": float(np.mean(r2_seed)),
+                "r2_seed_median": float(np.median(r2_seed)),
+                "r2_seed_sd": sample_std(r2_seed),
+                "n_seeds": int(len(g)),
+                "best_config": str(best_map[family]),
             }
         )
 
-    rng = np.random.RandomState(cfg.lc_seed)
+    return (
+        reorder_models(pd.DataFrame(summary_rows)),
+        seed_metrics,
+        predictions,
+        pred_agg,
+        best_map,
+        dev_idx,
+        test_idx,
+        pd.DataFrame(candidate_rows),
+    )
 
-    for point_i, frac in enumerate(fracs, start=1):
-        m = max(20, int(round(len(X) * frac)))
-        sub_idx = rng.choice(len(X), size=m, replace=False)
-        X_sub_raw, y_sub = X[sub_idx], y[sub_idx]
 
-        kf = KFold(n_splits=cfg.lc_cv_folds, shuffle=True, random_state=999 + point_i)
-        splits = list(kf.split(np.arange(m)))
+def random_sign_pvalues(differences: np.ndarray, trials: int, seed: int) -> Tuple[float, float]:
+    """Monte Carlo sign-randomization p-values for paired squared-error differences.
 
-        for repeat_i in range(1, cfg.lc_repeats + 1):
-            seed = (
-                cfg.lc_repeat_seeds[repeat_i - 1]
-                if cfg.lc_repeat_seeds
-                else (cfg.lc_seed + repeat_i)
+    The statistic is the mean paired difference in squared prediction error,
+    comparator minus reference. Random sign exchange implements the paired
+    randomization principle described by van der Voet (1994),
+    doi:10.1016/0169-7439(94)85050-X.
+    """
+    d = np.asarray(differences, dtype=float)
+    d = d[np.isfinite(d)]
+    if d.size == 0:
+        return np.nan, np.nan
+    observed = float(np.mean(d))
+    rng = np.random.default_rng(seed)
+    ge = 0
+    ge_abs = 0
+    remaining = int(trials)
+    chunk = 2000
+    while remaining > 0:
+        m = min(chunk, remaining)
+        signs = rng.choice(np.array([-1.0, 1.0]), size=(m, d.size))
+        sim = np.mean(signs * d[None, :], axis=1)
+        ge += int(np.sum(sim >= observed))
+        ge_abs += int(np.sum(np.abs(sim) >= abs(observed)))
+        remaining -= m
+    p_one = (ge + 1.0) / (trials + 1.0)
+    p_two = (ge_abs + 1.0) / (trials + 1.0)
+    return float(p_one), float(p_two)
+
+
+def van_der_voet_table(pred_agg: pd.DataFrame, trials: int, seed: int) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    if pred_agg.empty:
+        return pd.DataFrame()
+    for task, tg in pred_agg.groupby("task", sort=False):
+        losses = (
+            tg.groupby("family", sort=False)["squared_error_mean_across_seeds"]
+            .mean()
+            .sort_values()
+        )
+        if losses.empty:
+            continue
+        reference = str(losses.index[0])
+        ref = tg[tg["family"] == reference][
+            ["sample_index", "squared_error_mean_across_seeds"]
+        ].rename(columns={"squared_error_mean_across_seeds": "ref_se"})
+        ref_rmsep = float(np.sqrt(losses.iloc[0]))
+
+        for i, family in enumerate([f for f in MODEL_ORDER if f in set(tg["family"])]):
+            comp = tg[tg["family"] == family][
+                ["sample_index", "squared_error_mean_across_seeds"]
+            ].rename(columns={"squared_error_mean_across_seeds": "comp_se"})
+            pair = ref.merge(comp, on="sample_index", how="inner")
+            comp_msep = float(pair["comp_se"].mean()) if not pair.empty else np.nan
+            if family == reference:
+                p_one, p_two = 1.0, 1.0
+            else:
+                p_one, p_two = random_sign_pvalues(
+                    pair["comp_se"].values - pair["ref_se"].values,
+                    trials=trials,
+                    seed=seed + i + 1000 * TASK_ORDER.index(task),
+                )
+            rows.append(
+                {
+                    "task": task,
+                    "reference_family": reference,
+                    "comparator_family": family,
+                    "n_test": int(len(pair)),
+                    "reference_rmsep": ref_rmsep,
+                    "comparator_rmsep": float(np.sqrt(comp_msep)) if np.isfinite(comp_msep) else np.nan,
+                    "delta_msep_comparator_minus_reference": (
+                        float(comp_msep - pair["ref_se"].mean()) if not pair.empty else np.nan
+                    ),
+                    "p_one_sided_comparator_worse": p_one,
+                    "p_two_sided": p_two,
+                    "significantly_worse_at_0_05": bool(p_one < 0.05) if np.isfinite(p_one) else False,
+                    "loss_basis": "mean squared prediction error per sample; DL averaged across final seeds",
+                }
             )
+    return reorder_tasks(pd.DataFrame(rows))
 
-            for fam in families:
-                cand = best_map[fam]
-                fold_metrics = []
-                for fold_i, (tr_idx, va_idx) in enumerate(splits, start=1):
-                    X_tr_raw, y_tr = X_sub_raw[tr_idx], y_sub[tr_idx]
-                    X_va_raw, y_va = X_sub_raw[va_idx], y_sub[va_idx]
 
-                    met = _fit_predict_one_fold_for_lc(
-                        fam=fam,
-                        cand=cand,
-                        X_tr_raw=X_tr_raw,
-                        y_tr=y_tr,
-                        X_va_raw=X_va_raw,
-                        y_va=y_va,
-                        cfg=cfg,
-                        input_len=input_len,
-                        seed=seed,
-                        dataset_name=dataset_name,
-                        point_i=point_i,
-                        repeat_i=repeat_i,
-                        fold_i=fold_i,
-                        progress=progress,
-                    )
-                    fold_metrics.append(met)
+def learning_curve_sizes(n_dev: int, n_points: int) -> List[int]:
+    minimum = min(n_dev, max(20, int(math.ceil(0.20 * n_dev))))
+    if n_points <= 1 or minimum >= n_dev:
+        return [n_dev]
+    sizes = np.linspace(minimum, n_dev, n_points).round().astype(int)
+    return sorted(set(int(x) for x in sizes))
 
-                train_rmse = float(np.mean([m_["train_rmse"] for m_ in fold_metrics]))
-                val_rmse = float(np.mean([m_["val_rmse"] for m_ in fold_metrics]))
-                train_r2 = float(np.mean([m_["train_r2"] for m_ in fold_metrics]))
-                val_r2 = float(np.mean([m_["val_r2"] for m_ in fold_metrics]))
 
-                lc_rows.append(
+def fit_predict_direct_for_cv_curve(
+    family: str,
+    cand: Dict[str, Any],
+    X_train_raw: np.ndarray,
+    y_train: np.ndarray,
+    X_val_raw: np.ndarray,
+    y_val: np.ndarray,
+    cfg: ExperimentConfig,
+    seed: int,
+    task: str,
+    progress: FitProgress,
+) -> Tuple[np.ndarray, np.ndarray]:
+    Xtr, [Xva], _ = preprocess_fit_apply(X_train_raw, [X_val_raw], cfg.preprocess)
+    if not is_dl_family(family):
+        model = fit_classical_model(family, cand, Xtr, y_train)
+        tr_pred = np.asarray(model.predict(Xtr)).ravel()
+        va_pred = np.asarray(model.predict(Xva)).ravel()
+        progress.step(f"{task} | LC_CV | {family} | seed={seed}")
+        return tr_pred.astype(float), va_pred.astype(float)
+
+    set_seed(seed)
+    safe_clear_tf()
+    ys = fit_y_scaler(y_train)
+    ytr_s = ys.transform(y_train.reshape(-1, 1)).ravel()
+    yva_s = ys.transform(y_val.reshape(-1, 1)).ravel()
+    if family == "ANN":
+        model = build_mlp(Xtr.shape[1], cand["units"], MODEL_REGISTRY["ANN"]["dropout"])
+        Xtr_i, Xva_i = Xtr, Xva
+    else:
+        model = build_cnn1d(
+            Xtr.shape[1], cand["filters"], cand["kernel"],
+            MODEL_REGISTRY["CNN1D"]["dropout"], MODEL_REGISTRY["CNN1D"]["use_layernorm"]
+        )
+        Xtr_i, Xva_i = Xtr[..., None], Xva[..., None]
+    model.fit(
+        Xtr_i,
+        ytr_s,
+        validation_data=(Xva_i, yva_s),
+        epochs=cfg.epochs,
+        batch_size=cfg.batch_size,
+        callbacks=build_callbacks(cfg.patience),
+        verbose=0,
+    )
+    tr_s = model.predict(Xtr_i, verbose=0).ravel()
+    va_s = model.predict(Xva_i, verbose=0).ravel()
+    tr_pred = ys.inverse_transform(tr_s.reshape(-1, 1)).ravel()
+    va_pred = ys.inverse_transform(va_s.reshape(-1, 1)).ravel()
+    progress.step(f"{task} | LC_CV | {family} | seed={seed}")
+    return tr_pred.astype(float), va_pred.astype(float)
+
+
+def run_test_learning_curve(
+    X: np.ndarray,
+    y: np.ndarray,
+    dev_idx: np.ndarray,
+    test_idx: np.ndarray,
+    best_map: Dict[str, Dict[str, Any]],
+    cfg: ExperimentConfig,
+    task: str,
+    progress: FitProgress,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if not cfg.run_learning_curves:
+        return pd.DataFrame(), pd.DataFrame()
+    X_dev, y_dev = X[dev_idx], y[dev_idx]
+    X_test, y_test = X[test_idx], y[test_idx]
+    sizes = learning_curve_sizes(len(dev_idx), cfg.learning_curve_points)
+    rows: List[Dict[str, Any]] = []
+
+    families = [f for f in cfg.learning_curve_families if f in best_map and f in active_families(cfg)]
+    for family in families:
+        cand = best_map[family]
+        for repeat in range(cfg.learning_curve_repeats):
+            rng = np.random.default_rng(cfg.learning_curve_seed + repeat + 101 * TASK_ORDER.index(task))
+            order = rng.permutation(len(dev_idx))
+            for point, train_n in enumerate(sizes, 1):
+                sub = order[:train_n]
+                seed = cfg.learning_curve_seed + 1000 * repeat + point
+                metrics, _ = evaluate_selected_model(
+                    family,
+                    cand,
+                    X_dev[sub],
+                    y_dev[sub],
+                    X_test,
+                    y_test,
+                    test_idx,
+                    cfg,
+                    task,
+                    stage="LC_LOCKED_TEST",
+                    progress=progress,
+                    seed_override=[seed] if is_dl_family(family) else None,
+                )
+                rows.append(
                     {
-                        "dataset": dataset_name,
-                        "family": fam,
-                        "point": point_i,
-                        "train_fraction": float(frac),
-                        "train_n": int(m),
-                        "repeat": int(repeat_i),
-                        "seed": int(seed),
-                        "cv_folds": int(cfg.lc_cv_folds),
-                        "train_rmse": train_rmse,
-                        "cv_rmse": val_rmse,
-                        "train_r2": train_r2,
-                        "cv_r2": val_r2,
-                        "fixed_best_cand": str(cand),
+                        "task": task,
+                        "family": family,
+                        "point": point,
+                        "train_n": int(train_n),
+                        "train_fraction_of_development": float(train_n / len(dev_idx)),
+                        "repeat": repeat,
+                        "test_rmse": float(metrics["rmse"].mean()),
+                        "test_r2": float(metrics["r2"].mean()),
+                        "fixed_best_config": str(cand),
                     }
                 )
 
-        del X_sub_raw, y_sub
-        gc.collect()
-        safe_clear_tf()
-
-    sel_df = pd.DataFrame(select_rows)
-    lc_raw_df = pd.DataFrame(lc_rows)
-
-    g = lc_raw_df.groupby(
-        ["dataset", "family", "point", "train_fraction", "train_n"], as_index=False
+    raw = pd.DataFrame(rows)
+    if raw.empty:
+        return raw, pd.DataFrame()
+    agg = (
+        raw.groupby(["task", "family", "point", "train_n", "train_fraction_of_development"], as_index=False)
+        .agg(test_rmse_mean=("test_rmse", "mean"), test_rmse_std=("test_rmse", "std"),
+             test_r2_mean=("test_r2", "mean"), test_r2_std=("test_r2", "std"))
     )
-    lc_agg = g.agg(
-        train_rmse_mean=("train_rmse", "mean"),
-        train_rmse_std=("train_rmse", "std"),
-        cv_rmse_mean=("cv_rmse", "mean"),
-        cv_rmse_std=("cv_rmse", "std"),
-        train_r2_mean=("train_r2", "mean"),
-        train_r2_std=("train_r2", "std"),
-        cv_r2_mean=("cv_r2", "mean"),
-        cv_r2_std=("cv_r2", "std"),
-        n_repeats=("repeat", "nunique"),
+    agg[["test_rmse_std", "test_r2_std"]] = agg[["test_rmse_std", "test_r2_std"]].fillna(0.0)
+    return raw, reorder_models(reorder_tasks(agg))
+
+
+def run_cv_learning_curve(
+    X: np.ndarray,
+    y: np.ndarray,
+    dev_idx: np.ndarray,
+    best_map: Dict[str, Dict[str, Any]],
+    cfg: ExperimentConfig,
+    task: str,
+    progress: FitProgress,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Supplementary train/CV diagnostic restricted to the development data."""
+    if not cfg.run_learning_curves:
+        return pd.DataFrame(), pd.DataFrame()
+    X_dev, y_dev = X[dev_idx], y[dev_idx]
+    sizes = learning_curve_sizes(len(dev_idx), cfg.learning_curve_points)
+    rows: List[Dict[str, Any]] = []
+    families = [f for f in cfg.learning_curve_families if f in best_map and f in active_families(cfg)]
+
+    for family in families:
+        cand = best_map[family]
+        for repeat in range(cfg.learning_curve_repeats):
+            rng = np.random.default_rng(cfg.learning_curve_seed + 500 + repeat + 101 * TASK_ORDER.index(task))
+            order = rng.permutation(len(dev_idx))
+            for point, train_n in enumerate(sizes, 1):
+                sub = order[:train_n]
+                X_sub, y_sub = X_dev[sub], y_dev[sub]
+                splits = kfold_splits(len(sub), cfg.learning_curve_cv_folds, cfg.learning_curve_seed + point + repeat)
+                if not candidate_valid_for_splits(family, cand, splits, X_sub.shape[1]):
+                    continue
+                for fold, (tr, va) in enumerate(splits, 1):
+                    seed = cfg.learning_curve_seed + 1000 * repeat + 100 * point + fold
+                    tr_pred, va_pred = fit_predict_direct_for_cv_curve(
+                        family, cand, X_sub[tr], y_sub[tr], X_sub[va], y_sub[va],
+                        cfg, seed, task, progress
+                    )
+                    rows.append(
+                        {
+                            "task": task,
+                            "family": family,
+                            "point": point,
+                            "train_n": int(train_n),
+                            "repeat": repeat,
+                            "fold": fold,
+                            "train_rmse": rmse(y_sub[tr], tr_pred),
+                            "cv_rmse": rmse(y_sub[va], va_pred),
+                            "fixed_best_config": str(cand),
+                        }
+                    )
+
+    raw = pd.DataFrame(rows)
+    if raw.empty:
+        return raw, pd.DataFrame()
+    agg = (
+        raw.groupby(["task", "family", "point", "train_n"], as_index=False)
+        .agg(train_rmse_mean=("train_rmse", "mean"), train_rmse_std=("train_rmse", "std"),
+             cv_rmse_mean=("cv_rmse", "mean"), cv_rmse_std=("cv_rmse", "std"))
+    )
+    agg[["train_rmse_std", "cv_rmse_std"]] = agg[["train_rmse_std", "cv_rmse_std"]].fillna(0.0)
+    return raw, reorder_models(reorder_tasks(agg))
+
+
+def numerical_rank_summary(summary: pd.DataFrame, metric_col: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if summary.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    rank_rows: List[pd.DataFrame] = []
+    for task, g in summary.groupby("task", sort=False):
+        t = g[["task", "family", metric_col]].copy()
+        t["rank"] = t[metric_col].rank(method="min", ascending=True)
+        rank_rows.append(t)
+    ranks = reorder_models(reorder_tasks(pd.concat(rank_rows, ignore_index=True)))
+    counts = (
+        ranks.groupby("family", as_index=False)
+        .agg(
+            numerical_wins=("rank", lambda s: int(np.sum(np.asarray(s) == 1))),
+            top2_count=("rank", lambda s: int(np.sum(np.asarray(s) <= 2))),
+            tasks=("task", "nunique"),
+        )
+    )
+    counts = reorder_models(counts)
+    return ranks, counts
+
+
+def uncertainty_sig_digits(sd: float) -> int:
+    if not np.isfinite(sd) or sd <= 0:
+        return 2
+    exponent = math.floor(math.log10(abs(sd)))
+    scaled = abs(sd) / (10 ** exponent)
+    first = int(scaled)
+    second = int((scaled - first) * 10 + 1e-10)
+    if first == 1 or (first == 2 and second < 5):
+        return 2
+    return 1
+
+
+def format_mean_sd(mean: float, sd: float) -> str:
+    if not np.isfinite(mean):
+        return "NA"
+    if not np.isfinite(sd) or sd <= 0:
+        return format_sig(mean, 3)
+    sig = uncertainty_sig_digits(sd)
+    exponent = math.floor(math.log10(abs(sd)))
+    decimal_place = exponent - sig + 1
+    rounded_sd = round(sd, -decimal_place)
+    rounded_mean = round(mean, -decimal_place)
+    if abs(rounded_mean) >= 1e4 or (0 < abs(rounded_mean) < 1e-3) or abs(rounded_sd) < 1e-3:
+        decimals = max(0, sig - 1)
+        return f"{rounded_mean:.{decimals}e} +/- {rounded_sd:.{decimals}e}"
+    decimals = max(0, -decimal_place)
+    return f"{rounded_mean:.{decimals}f} +/- {rounded_sd:.{decimals}f}"
+
+
+def format_sig(value: float, sig: int = 3) -> str:
+    if value is None or not np.isfinite(value):
+        return "NA"
+    if value == 0:
+        return "0"
+    exponent = math.floor(math.log10(abs(value)))
+    decimals = sig - exponent - 1
+    if exponent >= sig + 1 or exponent <= -4:
+        return f"{value:.{sig - 1}e}"
+    return f"{value:.{max(0, decimals)}f}"
+
+
+def pivot_formatted_nested(summary: pd.DataFrame, value: str) -> pd.DataFrame:
+    rows = []
+    for task in TASK_ORDER:
+        g = summary[summary["task"] == task]
+        if g.empty:
+            continue
+        row: Dict[str, Any] = {"Task": task}
+        for family in MODEL_ORDER:
+            h = g[g["family"] == family]
+            if h.empty:
+                row[family] = "NA"
+            elif value == "rmse":
+                row[family] = format_mean_sd(float(h["rmse_mean"].iloc[0]), float(h["rmse_std"].iloc[0]))
+            else:
+                row[family] = format_mean_sd(float(h["r2_mean"].iloc[0]), float(h["r2_std"].iloc[0]))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def pivot_formatted_holdout(summary: pd.DataFrame, value: str) -> pd.DataFrame:
+    rows = []
+    for task in TASK_ORDER:
+        g = summary[summary["task"] == task]
+        if g.empty:
+            continue
+        row: Dict[str, Any] = {"Task": task}
+        for family in MODEL_ORDER:
+            h = g[g["family"] == family]
+            if h.empty:
+                row[family] = "NA"
+            elif value == "rmsep":
+                # DL dispersion reflects repeated stochastic fits; deterministic models have SD=0.
+                row[family] = format_mean_sd(float(h["rmsep_pooled"].iloc[0]), float(h["rmsep_seed_sd"].iloc[0]))
+            else:
+                row[family] = format_mean_sd(float(h["r2_mean_prediction"].iloc[0]), float(h["r2_seed_sd"].iloc[0]))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def dataset_overview_table(audit: pd.DataFrame) -> pd.DataFrame:
+    if audit.empty:
+        return pd.DataFrame()
+    out = audit[["task", "N", "p", "N_over_p"]].copy()
+    out.columns = ["Task", "N", "p", "N/p"]
+    out["N/p"] = out["N/p"].map(lambda x: f"{float(x):.3f}")
+    return reorder_tasks(out.rename(columns={"Task": "task"})).rename(columns={"task": "Task"})
+
+
+def latex_escape(value: Any) -> str:
+    text = str(value)
+    repl = {
+        "\\": r"\textbackslash{}", "&": r"\&", "%": r"\%", "$": r"\$",
+        "#": r"\#", "_": r"\_", "{": r"\{", "}": r"\}",
+    }
+    for old, new in repl.items():
+        text = text.replace(old, new)
+    return text
+
+
+def dataframe_to_latex(df: pd.DataFrame, caption: str, label: str) -> str:
+    safe = df.copy()
+    for col in safe.columns:
+        safe[col] = safe[col].map(latex_escape)
+    body = safe.to_latex(index=False, escape=False)
+    body = body.replace("+/-", r"$\pm$")
+    return (
+        "\\begin{table*}[t]\n"
+        "\\centering\n"
+        f"\\caption{{{caption}}}\n"
+        f"\\label{{{label}}}\n"
+        "\\small\n"
+        + body
+        + "\\end{table*}\n"
     )
 
-    for c in ["train_rmse_std", "cv_rmse_std", "train_r2_std", "cv_r2_std"]:
-        lc_agg[c] = lc_agg[c].fillna(0.0)
 
-    return sel_df, lc_raw_df, lc_agg
-
-
-def summarize_learning_curve(lc_agg_df: pd.DataFrame) -> pd.DataFrame:
-    g = lc_agg_df.groupby(["dataset", "family"])
-    out = g.agg(
-        cv_rmse_best=("cv_rmse_mean", "min"),
-        cv_rmse_last=("cv_rmse_mean", lambda s: float(s.iloc[-1])),
-        cv_r2_last=("cv_r2_mean", lambda s: float(s.iloc[-1])),
-        n_points=("cv_rmse_mean", "count"),
-    ).reset_index()
-    return out
-
-
-# =========================================================
-# 12) Figures (saved per dataset)
-# =========================================================
-
-def fig_bench_rmse_bar(
-    bench_summary_df: pd.DataFrame, out_dir_figs: str, dataset_name: str
-):
-    sub = bench_summary_df.sort_values("rmse_mean")
-    plt.figure()
-    plt.bar(sub["family"], sub["rmse_mean"], yerr=sub["rmse_std"])
-    plt.xticks(rotation=45, ha="right")
-    plt.ylabel("RMSE (mean ± std across outer folds)")
-    plt.title(f"{dataset_name} | RMSE")
-    plt.tight_layout()
-    path = os.path.join(out_dir_figs, f"bench_rmse_bar_{dataset_name}.png")
-    plt.savefig(path, dpi=200)
-    plt.close()
-
-
-def fig_bench_r2_bar(
-    bench_summary_df: pd.DataFrame, out_dir_figs: str, dataset_name: str
-):
-    sub = bench_summary_df.sort_values("r2_mean", ascending=False)
-    plt.figure()
-    plt.bar(sub["family"], sub["r2_mean"], yerr=sub["r2_std"])
-    plt.xticks(rotation=45, ha="right")
-    plt.ylabel("R² (mean ± std across outer folds)")
-    plt.title(f"{dataset_name} | R²")
-    plt.tight_layout()
-    path = os.path.join(out_dir_figs, f"bench_r2_bar_{dataset_name}.png")
-    plt.savefig(path, dpi=200)
-    plt.close()
-
-
-def fig_bench_rmse_box(bench_df: pd.DataFrame, out_dir_figs: str, dataset_name: str):
-    families = list(bench_df["family"].unique())
-    data = [bench_df[bench_df["family"] == f]["test_rmse_median"].values for f in families]
-    plt.figure()
-    plt.boxplot(data, labels=families, showfliers=True)
-    plt.xticks(rotation=45, ha="right")
-    plt.ylabel("RMSE (outer-test per fold)")
-    plt.title(f"{dataset_name} | RMSE distribution")
-    plt.tight_layout()
-    path = os.path.join(out_dir_figs, f"bench_rmse_box_{dataset_name}.png")
-    plt.savefig(path, dpi=200)
-    plt.close()
+def build_latex_bundle(
+    audit: pd.DataFrame,
+    nested_summary: pd.DataFrame,
+    holdout_summary: pd.DataFrame,
+    holdout_rank_counts: pd.DataFrame,
+    vdvt: pd.DataFrame,
+) -> str:
+    parts: List[str] = []
+    parts.append("% Automatically generated quantitative tables.\n")
+    parts.append(dataframe_to_latex(
+        dataset_overview_table(audit),
+        "Overview of the regression tasks included in the spectroscopy benchmark.",
+        "tab:datasets_generated",
+    ))
+    parts.append(dataframe_to_latex(
+        pivot_formatted_nested(nested_summary, "rmse"),
+        "Nested cross-validation outer-test RMSE (mean $\\pm$ SD across outer folds).",
+        "tab:nested_rmse_generated",
+    ))
+    parts.append(dataframe_to_latex(
+        pivot_formatted_nested(nested_summary, "r2"),
+        "Nested cross-validation outer-test $R^2$ (mean $\\pm$ SD across outer folds).",
+        "tab:nested_r2_generated",
+    ))
+    parts.append(dataframe_to_latex(
+        pivot_formatted_holdout(holdout_summary, "rmsep"),
+        "Locked independent-test RMSEP. For stochastic deep-learning models, the accompanying dispersion is across repeated final fits.",
+        "tab:holdout_rmsep_generated",
+    ))
+    parts.append(dataframe_to_latex(
+        pivot_formatted_holdout(holdout_summary, "r2"),
+        "Locked independent-test $R^2$. For stochastic deep-learning models, the accompanying dispersion is across repeated final fits.",
+        "tab:holdout_r2_generated",
+    ))
+    if not holdout_rank_counts.empty:
+        rank_table = holdout_rank_counts.rename(columns={
+            "family": "Model family", "numerical_wins": "Numerical wins",
+            "top2_count": "Top-2 counts", "tasks": "Tasks"
+        })
+        parts.append(dataframe_to_latex(
+            rank_table,
+            "Numerical performance summary across tasks using locked independent-test RMSEP ranks.",
+            "tab:holdout_ranks_generated",
+        ))
+    if not vdvt.empty:
+        stat = vdvt[[
+            "task", "reference_family", "comparator_family", "reference_rmsep",
+            "comparator_rmsep", "p_one_sided_comparator_worse", "significantly_worse_at_0_05"
+        ]].copy()
+        stat.columns = ["Task", "Reference", "Comparator", "Reference RMSEP", "Comparator RMSEP", "p", "Significantly worse"]
+        for col in ["Reference RMSEP", "Comparator RMSEP", "p"]:
+            stat[col] = stat[col].map(lambda x: format_sig(float(x), 3) if np.isfinite(float(x)) else "NA")
+        parts.append(dataframe_to_latex(
+            stat,
+            "Paired randomization comparisons of locked-test squared prediction errors. The reference is the numerically lowest-MSEP model within each task.",
+            "tab:van_der_voet_generated",
+        ))
+    return "\n\n".join(parts)
 
 
-def fig_bench_rmse_r2_scatter(
-    bench_df: pd.DataFrame, out_dir_figs: str, dataset_name: str
-):
-    plt.figure()
-    for fam in bench_df["family"].unique():
-        sf = bench_df[bench_df["family"] == fam]
-        plt.scatter(sf["test_rmse_median"], sf["test_r2_median"], label=fam, alpha=0.7)
-    plt.xlabel("RMSE (outer-test)")
-    plt.ylabel("R² (outer-test)")
-    plt.title(f"{dataset_name} | RMSE vs R² (folds)")
-    plt.legend(fontsize=8)
-    plt.tight_layout()
-    path = os.path.join(out_dir_figs, f"bench_rmse_r2_scatter_{dataset_name}.png")
-    plt.savefig(path, dpi=200)
-    plt.close()
-
-
-def fig_learning_curve_train_cv_panels(
-    lc_agg_df: pd.DataFrame, out_dir_figs: str, dataset_name: str
-):
-    fams = ["PLSR", "ANN", "CNN1D"]
-    fams = [f for f in fams if f in lc_agg_df["family"].unique()]
-
-    n_panels = len(fams)
-    if n_panels == 0:
-        return
-
-    fig, axes = plt.subplots(n_panels, 1, figsize=(7, 3.2 * n_panels), sharex=True)
-    if n_panels == 1:
-        axes = [axes]
-
-    for ax, fam in zip(axes, fams):
-        sf = lc_agg_df[lc_agg_df["family"] == fam].sort_values("train_n")
-
-        ax.errorbar(
-            sf["train_n"],
-            sf["train_rmse_mean"],
-            yerr=sf["train_rmse_std"],
-            marker="o",
-            label="Train RMSE",
-        )
-        ax.errorbar(
-            sf["train_n"],
-            sf["cv_rmse_mean"],
-            yerr=sf["cv_rmse_std"],
-            marker="o",
-            label="CV RMSE",
-        )
-
-        ax.set_title(f"{dataset_name} | {fam} | Learning Curve (Train vs CV)")
-        ax.set_ylabel("RMSE")
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.25)
-
-    axes[-1].set_xlabel("Train N (subsample size)")
-    plt.tight_layout()
-
-    path = os.path.join(out_dir_figs, f"learning_curve_train_cv_panels_{dataset_name}.png")
-    plt.savefig(path, dpi=200)
+def save_figure(fig, png_path: Path, pdf_path: Optional[Path] = None) -> None:
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(png_path, dpi=300, bbox_inches="tight")
+    if pdf_path is not None:
+        fig.savefig(pdf_path, bbox_inches="tight")
     plt.close(fig)
 
 
-# =========================================================
-# 13) Main runner
-# =========================================================
+def plot_task_benchmark(task: str, nested_summary: pd.DataFrame, out_dir: Path) -> None:
+    g = nested_summary[nested_summary["task"] == task].copy()
+    if g.empty:
+        return
+    g["family"] = pd.Categorical(g["family"], MODEL_ORDER, ordered=True)
+    g = g.sort_values("family")
+    for metric, err, ylabel, suffix in [
+        ("rmse_mean", "rmse_std", "Outer-test RMSE", "rmse"),
+        ("r2_mean", "r2_std", r"Outer-test $R^2$", "r2"),
+    ]:
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        ax.bar(g["family"].astype(str), g[metric], yerr=g[err], capsize=3)
+        ax.set_title(task)
+        ax.set_ylabel(ylabel)
+        ax.set_xlabel("Model family")
+        ax.grid(axis="y", alpha=0.2)
+        save_figure(fig, out_dir / f"{safe_slug(task)}_{suffix}.png")
 
-def main():
-    cfg = default_cfg()
 
-    DATASETS: List[DatasetConfig] = [
-        DatasetConfig(
-            name="mangos_TA_Vit_C_TA",
-            kind="excel",
-            path="data/mangos_TA_Vit_C.xlsx",
-            satir_ilk=1,
-            satir_son=59,
-            bas_sutun=4,
-            bit_sutun=1560,
-            col_Y=2,
-        ),
-        DatasetConfig(
-            name="mangos_TA_Vit_C_VitC",
-            kind="excel",
-            path="data/mangos_TA_Vit_C.xlsx",
-            satir_ilk=1,
-            satir_son=59,
-            bas_sutun=4,
-            bit_sutun=1560,
-            col_Y=3,
-        ),
-        DatasetConfig(
-            name="Cucurbitaceae_Fruits_Water",
-            kind="excel",
-            path="data/Cucurbitaceae_Fruits.xlsx",
-            satir_ilk=1,
-            satir_son=301,
-            bas_sutun=3,
-            bit_sutun=232,
-            col_Y=2,
-        ),
-        DatasetConfig(
-            name="Cucurbitaceae_Fruits_Brix",
-            kind="excel",
-            path="data/Cucurbitaceae_Fruits.xlsx",
-            satir_ilk=1,
-            satir_son=301,
-            bas_sutun=3,
-            bit_sutun=232,
-            col_Y=3,
-        ),
-        DatasetConfig(
-            name="Milk",
-            kind="csv",
-            path="data/milk.csv",
-            satir_ilk=0,
-            satir_son=1224,
-            bas_sutun=270,
-            bit_sutun=526,
-            col_Y=1,
-            sep=",",
-        ),
-        DatasetConfig(
-            name="Mangoes_Cvit",
-            kind="excel",
-            path="data/Mangoes.xlsx",
-            satir_ilk=1,
-            satir_son=187,
-            bas_sutun=5,
-            bit_sutun=1561,
-            col_Y=2,
-        ),
-        DatasetConfig(
-            name="Mangoes_TA",
-            kind="excel",
-            path="data/Mangoes.xlsx",
-            satir_ilk=1,
-            satir_son=187,
-            bas_sutun=5,
-            bit_sutun=1561,
-            col_Y=3,
-        ),
-        DatasetConfig(
-            name="Mangoes_Brix",
-            kind="excel",
-            path="data/Mangoes.xlsx",
-            satir_ilk=1,
-            satir_son=187,
-            bas_sutun=5,
-            bit_sutun=1561,
-            col_Y=4,
-        ),
-        DatasetConfig(
-            name="DATASET_csv",
-            kind="csv",
-            path="data/DATASET.csv",
-            satir_ilk=0,
-            satir_son=75,
-            bas_sutun=3,
-            bit_sutun=206,
-            col_Y=2,
-            sep=";",
-        ),
-        DatasetConfig(
-            name="Cary_centrifuged_Brix_averaged",
-            kind="excel",
-            path="data/Cary_centrifuged_Brix_averaged.xlsx",
-            satir_ilk=2,
-            satir_son=645,
-            bas_sutun=1198,
-            bit_sutun=1437,
-            col_Y=1772,
-        ),
-    ]
+def plot_global_complexity(candidate_log: pd.DataFrame, figures_dir: Path) -> None:
+    if candidate_log.empty:
+        return
+    g = candidate_log[
+        (candidate_log["family"].isin(["ANN", "CNN1D"]))
+        & (candidate_log["status"] == "evaluated")
+        & candidate_log["approx_flops"].notna()
+    ].copy()
+    if g.empty:
+        return
+    agg = (
+        g.groupby(["task", "family", "candidate", "param_count", "approx_flops"], as_index=False)
+        .agg(inner_cv_rmse_mean=("inner_cv_rmse", "mean"), inner_cv_rmse_std=("inner_cv_rmse", "std"))
+    )
+    agg["inner_cv_rmse_std"] = agg["inner_cv_rmse_std"].fillna(0.0)
 
-    if len(DATASETS) == 0:
-        raise RuntimeError("DATASETS listesi boş.")
-
-    for dcfg in DATASETS:
-        dirs = ensure_dataset_dirs(dcfg.name)
-        print("\n" + "=" * 90)
-        print(f"DATASET: {dcfg.name}")
-        print(f"Saving to: {dirs['base']}")
-        print("=" * 90)
-
-        X, y = load_dataset(dcfg)
-        n, p = X.shape
-        families = [k for k, v in MODEL_REGISTRY.items() if v.get("enabled", False)]
-        do_lc = bool(cfg.run_learning_curve)
-
-        total_fits = estimate_total_fits_for_dataset(cfg, families, do_lc)
-        print(f"N={n} | p={p} | Families={families}")
-        print(f"TOTAL FITS (estimated) for this dataset = {total_fits}")
-        progress = FitProgress(total_fits)
-
-        bench_df, candlog_df = run_outer_cv_benchmark(X, y, dcfg.name, cfg, progress)
-        bench_summary_df = make_benchmark_summary(bench_df)
-        freq_df = best_config_frequencies(bench_df)
-
-        save_table_xlsx(
-            os.path.join(dirs["tables"], "bench_raw.xlsx"), bench_df, "bench_raw"
-        )
-        save_table_xlsx(
-            os.path.join(dirs["tables"], "bench_summary.xlsx"),
-            bench_summary_df,
-            "bench_summary",
-        )
-        save_table_xlsx(
-            os.path.join(dirs["tables"], "best_config_freq.xlsx"),
-            freq_df,
-            "best_config_freq",
-        )
-
-        run_log_df = progress.to_dataframe()
-        save_table_xlsx(
-            os.path.join(dirs["tables"], "run_log.xlsx"), run_log_df, "run_log"
-        )
-
-        input_len = X.shape[1]
-        complexity_tables = build_dl_complexity_tables(
-            dataset_name=dcfg.name,
-            bench_df=bench_df,
-            candlog_df=candlog_df,
-            input_len=input_len,
-        )
-
-        save_multi_table_xlsx(
-            os.path.join(dirs["tables"], "dl_complexity.xlsx"),
-            complexity_tables,
-        )
-
-        fig_dl_complexity_rmse_panels(
-            complexity_tables["inner_candidates_agg"],
-            dirs["figs"],
-            dcfg.name,
-        )
-
-        fig_bench_rmse_bar(bench_summary_df, dirs["figs"], dcfg.name)
-        fig_bench_r2_bar(bench_summary_df, dirs["figs"], dcfg.name)
-        fig_bench_rmse_box(bench_df, dirs["figs"], dcfg.name)
-        fig_bench_rmse_r2_scatter(bench_df, dirs["figs"], dcfg.name)
-
-        if do_lc:
-            lc_select_df, lc_raw_df, lc_agg_df = run_learning_curve(
-                X, y, dcfg.name, cfg, progress
+    fig, axes = plt.subplots(3, 3, figsize=(14, 11))
+    handles = []
+    labels = []
+    for ax, task in zip(axes.flat, TASK_ORDER):
+        tg = agg[agg["task"] == task]
+        for family in ["ANN", "CNN1D"]:
+            fg = tg[tg["family"] == family].sort_values("approx_flops")
+            if fg.empty:
+                continue
+            h = ax.errorbar(
+                fg["approx_flops"], fg["inner_cv_rmse_mean"], yerr=fg["inner_cv_rmse_std"],
+                marker="o", linewidth=1.2, capsize=2, label=family
             )
-            lc_summary_df = summarize_learning_curve(lc_agg_df)
+            if family not in labels:
+                handles.append(h); labels.append(family)
+        ax.set_xscale("log")
+        ax.set_title(task, fontsize=9)
+        ax.set_xlabel("Approx. FLOPs / forward pass")
+        ax.set_ylabel("Inner-CV RMSE")
+        ax.grid(alpha=0.2)
+    if handles:
+        fig.legend(handles, labels, loc="lower center", ncol=len(labels), frameon=False)
+    fig.suptitle("Deep-learning complexity versus validation error", y=0.995)
+    fig.tight_layout(rect=(0, 0.04, 1, 0.98))
+    save_figure(
+        fig,
+        figures_dir / "Figure1_complexity_panels.png",
+        figures_dir / "Figure1_complexity_panels.pdf",
+    )
 
-            save_table_xlsx(
-                os.path.join(dirs["tables"], "learning_curve_selected_config.xlsx"),
-                lc_select_df,
-                "lc_selected",
-            )
-            save_table_xlsx(
-                os.path.join(dirs["tables"], "learning_curve_raw.xlsx"),
-                lc_raw_df,
-                "lc_raw",
-            )
-            save_table_xlsx(
-                os.path.join(dirs["tables"], "learning_curve_agg.xlsx"),
-                lc_agg_df,
-                "lc_agg",
-            )
-            save_table_xlsx(
-                os.path.join(dirs["tables"], "learning_curve_summary.xlsx"),
-                lc_summary_df,
-                "lc_summary",
-            )
 
-            fig_learning_curve_train_cv_panels(lc_agg_df, dirs["figs"], dcfg.name)
+def plot_global_test_learning_curve(lc_agg: pd.DataFrame, figures_dir: Path) -> None:
+    if lc_agg.empty:
+        return
+    fig, axes = plt.subplots(3, 3, figsize=(14, 11))
+    handles, labels = [], []
+    for ax, task in zip(axes.flat, TASK_ORDER):
+        tg = lc_agg[lc_agg["task"] == task]
+        for family in ["PLSR", "ANN", "CNN1D"]:
+            fg = tg[tg["family"] == family].sort_values("train_n")
+            if fg.empty:
+                continue
+            h = ax.errorbar(
+                fg["train_n"], fg["test_rmse_mean"], yerr=fg["test_rmse_std"],
+                marker="o", linewidth=1.2, capsize=2, label=family
+            )
+            if family not in labels:
+                handles.append(h); labels.append(family)
+        ax.set_title(task, fontsize=9)
+        ax.set_xlabel("Training samples from development set")
+        ax.set_ylabel("Locked-test RMSE")
+        ax.grid(alpha=0.2)
+    if handles:
+        fig.legend(handles, labels, loc="lower center", ncol=len(labels), frameon=False)
+    fig.suptitle("Independent-test learning curves", y=0.995)
+    fig.tight_layout(rect=(0, 0.04, 1, 0.98))
+    save_figure(
+        fig,
+        figures_dir / "Figure2_independent_test_learning_curves.png",
+        figures_dir / "Figure2_independent_test_learning_curves.pdf",
+    )
 
-        del X, y, bench_df, candlog_df, complexity_tables, bench_summary_df
-        del freq_df, run_log_df
-        if do_lc:
-            del lc_select_df, lc_raw_df, lc_agg_df, lc_summary_df
-        gc.collect()
+
+def plot_global_cv_learning_curve(lc_agg: pd.DataFrame, figures_dir: Path) -> None:
+    if lc_agg.empty:
+        return
+    fig, axes = plt.subplots(3, 3, figsize=(14, 11))
+    family_handles: Dict[str, Any] = {}
+    for ax, task in zip(axes.flat, TASK_ORDER):
+        tg = lc_agg[lc_agg["task"] == task]
+        for family in ["PLSR", "ANN", "CNN1D"]:
+            fg = tg[tg["family"] == family].sort_values("train_n")
+            if fg.empty:
+                continue
+            line, = ax.plot(fg["train_n"], fg["cv_rmse_mean"], marker="o", linewidth=1.2, label=family)
+            ax.plot(fg["train_n"], fg["train_rmse_mean"], linestyle="--", linewidth=1.0, color=line.get_color())
+            family_handles.setdefault(family, line)
+        ax.set_title(task, fontsize=9)
+        ax.set_xlabel("Training subset size")
+        ax.set_ylabel("RMSE")
+        ax.grid(alpha=0.2)
+    handles = list(family_handles.values())
+    labels = list(family_handles.keys())
+    if handles:
+        fig.legend(handles, labels, loc="lower center", ncol=len(labels), frameon=False)
+    fig.suptitle("Development-set learning curves: solid = CV, dashed = training", y=0.995)
+    fig.tight_layout(rect=(0, 0.04, 1, 0.98))
+    save_figure(
+        fig,
+        figures_dir / "FigureS1_cv_learning_curves.png",
+        figures_dir / "FigureS1_cv_learning_curves.pdf",
+    )
+
+
+def save_csv(df: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index=False)
+
+
+def save_excel_workbook(path: Path, sheets: Dict[str, pd.DataFrame]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        for name, df in sheets.items():
+            df.to_excel(writer, sheet_name=name[:31], index=False)
+
+
+def save_json(obj: Any, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False, default=str)
+
+
+def run_pipeline(cfg: ExperimentConfig, repo_root: Path) -> Path:
+    if cfg.smoke_test:
+        apply_smoke_profile(cfg)
+    families = active_families(cfg)
+    out_root = repo_root / cfg.output_root
+    raw_dir = out_root / "raw"
+    tables_dir = out_root / "tables"
+    figures_dir = out_root / "figures"
+    latex_dir = out_root / "latex"
+    for d in [raw_dir, tables_dir, figures_dir, latex_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    progress = FitProgress()
+    audit_rows: List[Dict[str, Any]] = []
+    split_rows: List[Dict[str, Any]] = []
+    nested_raw_frames: List[pd.DataFrame] = []
+    nested_pred_frames: List[pd.DataFrame] = []
+    nested_candidate_frames: List[pd.DataFrame] = []
+    holdout_summary_frames: List[pd.DataFrame] = []
+    holdout_seed_frames: List[pd.DataFrame] = []
+    holdout_pred_frames: List[pd.DataFrame] = []
+    holdout_pred_agg_frames: List[pd.DataFrame] = []
+    holdout_candidate_frames: List[pd.DataFrame] = []
+    lc_test_raw_frames: List[pd.DataFrame] = []
+    lc_test_agg_frames: List[pd.DataFrame] = []
+    lc_cv_raw_frames: List[pd.DataFrame] = []
+    lc_cv_agg_frames: List[pd.DataFrame] = []
+
+    for dataset_number, dcfg in enumerate(manuscript_datasets(), 1):
+        print(f"\n=== [{dataset_number}/{len(TASK_ORDER)}] {dcfg.task} ===")
+        if cfg.synthetic:
+            X, y = synthetic_dataset(dcfg, seed=10000 + dataset_number)
+        else:
+            X, y = load_dataset(dcfg, repo_root)
+        audit_rows.append(audit_dataset(X, y, dcfg, synthetic=cfg.synthetic))
+
+        nested_raw, nested_pred, nested_candidates = run_nested_cv(X, y, cfg, dcfg.task, progress)
+        nested_raw_frames.append(nested_raw)
+        nested_pred_frames.append(nested_pred)
+        nested_candidate_frames.append(nested_candidates)
+
+        (
+            holdout_summary,
+            holdout_seed,
+            holdout_pred,
+            holdout_pred_agg,
+            best_map,
+            dev_idx,
+            test_idx,
+            holdout_candidates,
+        ) = run_independent_test(X, y, cfg, dcfg.task, progress)
+        holdout_summary_frames.append(holdout_summary)
+        holdout_seed_frames.append(holdout_seed)
+        holdout_pred_frames.append(holdout_pred)
+        holdout_pred_agg_frames.append(holdout_pred_agg)
+        holdout_candidate_frames.append(holdout_candidates)
+
+        split_rows.extend(
+            {"task": dcfg.task, "sample_index": int(i), "split": "development"} for i in dev_idx
+        )
+        split_rows.extend(
+            {"task": dcfg.task, "sample_index": int(i), "split": "locked_test"} for i in test_idx
+        )
+
+        if cfg.run_learning_curves:
+            lc_raw, lc_agg = run_test_learning_curve(
+                X, y, dev_idx, test_idx, best_map, cfg, dcfg.task, progress
+            )
+            lc_test_raw_frames.append(lc_raw)
+            lc_test_agg_frames.append(lc_agg)
+            cv_raw, cv_agg = run_cv_learning_curve(
+                X, y, dev_idx, best_map, cfg, dcfg.task, progress
+            )
+            lc_cv_raw_frames.append(cv_raw)
+            lc_cv_agg_frames.append(cv_agg)
+
         safe_clear_tf()
+        gc.collect()
 
-        print(f"\n[{dcfg.name}] DONE. Outputs saved under: {dirs['base']}")
+    audit_df = reorder_tasks(pd.DataFrame(audit_rows))
+    split_df = reorder_tasks(pd.DataFrame(split_rows))
+    nested_raw_df = pd.concat(nested_raw_frames, ignore_index=True) if nested_raw_frames else pd.DataFrame()
+    nested_predictions_df = pd.concat(nested_pred_frames, ignore_index=True) if nested_pred_frames else pd.DataFrame()
+    nested_candidates_df = pd.concat(nested_candidate_frames, ignore_index=True) if nested_candidate_frames else pd.DataFrame()
+    holdout_summary_df = reorder_models(reorder_tasks(pd.concat(holdout_summary_frames, ignore_index=True))) if holdout_summary_frames else pd.DataFrame()
+    holdout_seed_df = pd.concat(holdout_seed_frames, ignore_index=True) if holdout_seed_frames else pd.DataFrame()
+    holdout_predictions_df = pd.concat(holdout_pred_frames, ignore_index=True) if holdout_pred_frames else pd.DataFrame()
+    holdout_pred_agg_df = pd.concat(holdout_pred_agg_frames, ignore_index=True) if holdout_pred_agg_frames else pd.DataFrame()
+    holdout_candidates_df = pd.concat(holdout_candidate_frames, ignore_index=True) if holdout_candidate_frames else pd.DataFrame()
+    lc_test_raw_df = pd.concat(lc_test_raw_frames, ignore_index=True) if lc_test_raw_frames else pd.DataFrame()
+    lc_test_agg_df = pd.concat(lc_test_agg_frames, ignore_index=True) if lc_test_agg_frames else pd.DataFrame()
+    lc_cv_raw_df = pd.concat(lc_cv_raw_frames, ignore_index=True) if lc_cv_raw_frames else pd.DataFrame()
+    lc_cv_agg_df = pd.concat(lc_cv_agg_frames, ignore_index=True) if lc_cv_agg_frames else pd.DataFrame()
 
-    print("\nALL DATASETS DONE. Check outputs/<dataset_name>/ folders.")
+    nested_summary_df = summarize_nested_cv(nested_raw_df)
+    vdvt_df = van_der_voet_table(
+        holdout_pred_agg_df,
+        trials=cfg.randomization_trials,
+        seed=cfg.randomization_seed,
+    )
+    nested_ranks_df, nested_rank_counts_df = numerical_rank_summary(nested_summary_df, "rmse_mean")
+    holdout_ranks_df, holdout_rank_counts_df = numerical_rank_summary(holdout_summary_df, "rmsep_pooled")
+
+    complexity_df = pd.DataFrame()
+    if not nested_candidates_df.empty:
+        cg = nested_candidates_df[
+            (nested_candidates_df["family"].isin(["ANN", "CNN1D"]))
+            & (nested_candidates_df["status"] == "evaluated")
+        ].copy()
+        if not cg.empty:
+            complexity_df = (
+                cg.groupby(["task", "family", "candidate", "param_count", "approx_flops"], as_index=False)
+                .agg(inner_cv_rmse_mean=("inner_cv_rmse", "mean"),
+                     inner_cv_rmse_std=("inner_cv_rmse", "std"),
+                     evaluations=("inner_cv_rmse", "count"))
+            )
+            complexity_df["inner_cv_rmse_std"] = complexity_df["inner_cv_rmse_std"].fillna(0.0)
+            complexity_df = reorder_models(reorder_tasks(complexity_df))
+
+    raw_outputs = {
+        "dataset_audit.csv": audit_df,
+        "split_manifest.csv": split_df,
+        "nested_cv_raw.csv": nested_raw_df,
+        "nested_cv_summary.csv": nested_summary_df,
+        "nested_cv_predictions.csv": nested_predictions_df,
+        "nested_cv_candidates.csv": nested_candidates_df,
+        "independent_test_summary.csv": holdout_summary_df,
+        "independent_test_seed_metrics.csv": holdout_seed_df,
+        "independent_test_predictions.csv": holdout_predictions_df,
+        "independent_test_predictions_aggregated.csv": holdout_pred_agg_df,
+        "independent_test_candidates.csv": holdout_candidates_df,
+        "van_der_voet_randomization.csv": vdvt_df,
+        "nested_cv_task_ranks.csv": nested_ranks_df,
+        "nested_cv_rank_summary.csv": nested_rank_counts_df,
+        "independent_test_task_ranks.csv": holdout_ranks_df,
+        "independent_test_rank_summary.csv": holdout_rank_counts_df,
+        "learning_curve_independent_test_raw.csv": lc_test_raw_df,
+        "learning_curve_independent_test_summary.csv": lc_test_agg_df,
+        "learning_curve_cv_diagnostic_raw.csv": lc_cv_raw_df,
+        "learning_curve_cv_diagnostic_summary.csv": lc_cv_agg_df,
+        "dl_complexity.csv": complexity_df,
+        "run_log.csv": progress.to_dataframe(),
+    }
+    for name, df in raw_outputs.items():
+        save_csv(df, raw_dir / name)
+
+    save_excel_workbook(
+        tables_dir / "revision_tables.xlsx",
+        {
+            "Dataset_Audit": audit_df,
+            "Nested_CV_Summary": nested_summary_df,
+            "Independent_Test": holdout_summary_df,
+            "Van_der_Voet": vdvt_df,
+            "Nested_Ranks": nested_rank_counts_df,
+            "Independent_Ranks": holdout_rank_counts_df,
+            "LC_Independent_Test": lc_test_agg_df,
+            "LC_CV_Diagnostic": lc_cv_agg_df,
+            "DL_Complexity": complexity_df,
+        },
+    )
+
+    latex_text = build_latex_bundle(
+        audit_df, nested_summary_df, holdout_summary_df, holdout_rank_counts_df, vdvt_df
+    )
+    (latex_dir / "latex_tables.txt").write_text(latex_text, encoding="utf-8")
+
+    for task in TASK_ORDER:
+        plot_task_benchmark(task, nested_summary_df, figures_dir)
+    plot_global_complexity(nested_candidates_df, figures_dir)
+    plot_global_test_learning_curve(lc_test_agg_df, figures_dir)
+    plot_global_cv_learning_curve(lc_cv_agg_df, figures_dir)
+
+    run_config = asdict(cfg)
+    run_config.update(
+        {
+            "tensorflow_available": TF_AVAILABLE,
+            "active_families": families,
+            "dataset_tasks": TASK_ORDER,
+            "data_configs": [asdict(x) for x in manuscript_datasets()],
+        }
+    )
+    save_json(run_config, out_root / "run_config.json")
+    print(f"\nCompleted. Outputs written to: {out_root}")
+    return out_root
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Food NIR spectroscopy regression benchmark")
+    p.add_argument("--synthetic", action="store_true", help="Use generated spectroscopy-like data instead of local data files.")
+    p.add_argument("--smoke-test", action="store_true", help="Use reduced grids/epochs for a fast end-to-end validation.")
+    p.add_argument("--disable-dl", action="store_true", help="Run only PLSR, Ridge, and SVR.")
+    p.add_argument("--skip-learning-curves", action="store_true", help="Skip learning-curve calculations and figures.")
+    p.add_argument("--holdout-fraction", type=float, default=0.20, help="Fraction reserved as the locked independent test set.")
+    p.add_argument("--holdout-seed", type=int, default=2026, help="Random seed for the locked independent split.")
+    p.add_argument("--randomization-trials", type=int, default=9999, help="Monte Carlo trials for paired randomization tests.")
+    p.add_argument("--output-root", type=str, default="outputs/revision_results", help="Output directory relative to repository root.")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if not (0.05 <= args.holdout_fraction <= 0.50):
+        raise ValueError("--holdout-fraction must be between 0.05 and 0.50.")
+    cfg = ExperimentConfig(
+        holdout_fraction=args.holdout_fraction,
+        holdout_seed=args.holdout_seed,
+        randomization_trials=args.randomization_trials,
+        output_root=args.output_root,
+        disable_dl=args.disable_dl,
+        synthetic=args.synthetic,
+        smoke_test=args.smoke_test,
+        run_learning_curves=not args.skip_learning_curves,
+    )
+    repo_root = Path(__file__).resolve().parent
+    run_pipeline(cfg, repo_root)
 
 
 if __name__ == "__main__":
