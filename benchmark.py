@@ -125,6 +125,7 @@ class DatasetConfig:
     feature_stop: int
     target_col: int
     sep: str = ","
+    sheet_name: Optional[str] = None
     target_unit: str = ""
     spectral_range: str = ""
     expected_n: Optional[int] = None
@@ -132,25 +133,66 @@ class DatasetConfig:
 
 
 def manuscript_datasets() -> List[DatasetConfig]:
+    """Return the nine regression tasks used in the manuscript benchmark.
+
+    Column indices follow zero-based Python indexing. Excel sheet names are
+    specified explicitly to make data loading independent of workbook sheet order.
+    """
     return [
-        DatasetConfig("Mango-A (TA)", "excel", "data/mangos_TA_Vit_C.xlsx", 1, 59, 4, 1560, 2,
-                      target_unit="mg/100gr FM", spectral_range="999.9-2500.2 nm", expected_n=58, expected_p=1556),
-        DatasetConfig("Mango-A (Vitamin C)", "excel", "data/mangos_TA_Vit_C.xlsx", 1, 59, 4, 1560, 3,
-                      target_unit="mg/100gr FM", spectral_range="999.9-2500.2 nm", expected_n=58, expected_p=1556),
-        DatasetConfig("Cucurbitaceae (Water)", "excel", "data/Cucurbitaceae_Fruits.xlsx", 1, 301, 3, 232, 2,
-                      target_unit="%", spectral_range="381-1065 nm", expected_n=300, expected_p=229),
-        DatasetConfig("Cucurbitaceae (Brix)", "excel", "data/Cucurbitaceae_Fruits.xlsx", 1, 301, 3, 232, 1,
-                      target_unit="% Brix", spectral_range="381-1065 nm", expected_n=300, expected_p=229),
-        DatasetConfig("Milk (Fat)", "csv", "data/milk.csv", 0, 1224, 270, 526, 1, sep=",",
-                      target_unit="%", spectral_range="960-1690 nm", expected_n=1224, expected_p=256),
-        DatasetConfig("Mango-B (TA)", "excel", "data/Mangoes.xlsx", 1, 187, 5, 1561, 3,
-                      target_unit="mg/100g", spectral_range="999.9-2500.2 nm", expected_n=186, expected_p=1556),
-        DatasetConfig("Mango-B (Vitamin C)", "excel", "data/Mangoes.xlsx", 1, 187, 5, 1561, 2,
-                      target_unit="mg/100g", spectral_range="999.9-2500.2 nm", expected_n=186, expected_p=1556),
-        DatasetConfig("Mango-B (Brix)", "excel", "data/Mangoes.xlsx", 1, 187, 5, 1561, 4,
-                      target_unit="deg Brix", spectral_range="999.9-2500.2 nm", expected_n=186, expected_p=1556),
-        DatasetConfig("Grapes (Sugar)", "csv", "data/DATASET.csv", 0, 75, 3, 206, 2, sep=";",
-                      target_unit="g/L", spectral_range="397.32-1003.5 nm", expected_n=75, expected_p=203),
+        DatasetConfig(
+            "Mango-A (TA)", "excel", "data/mangos_TA_Vit_C.xlsx",
+            1, 59, 4, 1561, 2, sheet_name="Raw Spectra data",
+            target_unit="mg/100gr FM", spectral_range="999.9-2500.2 nm",
+            expected_n=58, expected_p=1557,
+        ),
+        DatasetConfig(
+            "Mango-A (Vitamin C)", "excel", "data/mangos_TA_Vit_C.xlsx",
+            1, 59, 4, 1561, 3, sheet_name="Raw Spectra data",
+            target_unit="mg/100gr FM", spectral_range="999.9-2500.2 nm",
+            expected_n=58, expected_p=1557,
+        ),
+        DatasetConfig(
+            "Cucurbitaceae (Water)", "excel", "data/Cucurbitaceae_Fruits.xlsx",
+            1, 301, 3, 232, 1, sheet_name="Calibration Set",
+            target_unit="%", spectral_range="381-1065 nm",
+            expected_n=300, expected_p=229,
+        ),
+        DatasetConfig(
+            "Cucurbitaceae (Brix)", "excel", "data/Cucurbitaceae_Fruits.xlsx",
+            1, 301, 3, 232, 2, sheet_name="Calibration Set",
+            target_unit="% Brix", spectral_range="381-1065 nm",
+            expected_n=300, expected_p=229,
+        ),
+        DatasetConfig(
+            "Milk (Fat)", "csv", "data/milk.csv",
+            0, 1224, 270, 526, 1, sep=",",
+            target_unit="%", spectral_range="960-1690 nm",
+            expected_n=1224, expected_p=256,
+        ),
+        DatasetConfig(
+            "Mango-B (TA)", "excel", "data/Mangoes.xlsx",
+            1, 187, 5, 1562, 3, sheet_name="RawData",
+            target_unit="mg/100g", spectral_range="999.9-2500.2 nm",
+            expected_n=186, expected_p=1557,
+        ),
+        DatasetConfig(
+            "Mango-B (Vitamin C)", "excel", "data/Mangoes.xlsx",
+            1, 187, 5, 1562, 2, sheet_name="RawData",
+            target_unit="mg/100g", spectral_range="999.9-2500.2 nm",
+            expected_n=186, expected_p=1557,
+        ),
+        DatasetConfig(
+            "Mango-B (Brix)", "excel", "data/Mangoes.xlsx",
+            1, 187, 5, 1562, 4, sheet_name="RawData",
+            target_unit="deg Brix", spectral_range="999.9-2500.2 nm",
+            expected_n=186, expected_p=1557,
+        ),
+        DatasetConfig(
+            "Grapes (Sugar)", "csv", "data/DATASET.csv",
+            0, 274, 3, 207, 2, sep=";",
+            target_unit="g/L", spectral_range="397.32-1003.5 nm",
+            expected_n=274, expected_p=204,
+        ),
     ]
 
 
@@ -170,7 +212,10 @@ def load_dataset(cfg: DatasetConfig, repo_root: Path) -> Tuple[np.ndarray, np.nd
     if not path.exists():
         raise FileNotFoundError(f"Required dataset file not found: {path}")
     if cfg.kind == "excel":
-        df = pd.read_excel(path, engine="openpyxl", header=None)
+        df = pd.read_excel(
+            path, engine="openpyxl", header=None,
+            sheet_name=cfg.sheet_name if cfg.sheet_name is not None else 0,
+        )
     elif cfg.kind == "csv":
         df = pd.read_csv(path, sep=cfg.sep)
     else:
