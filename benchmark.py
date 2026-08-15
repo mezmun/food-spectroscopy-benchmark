@@ -23,9 +23,12 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import math
+import os
 import random
+import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -73,6 +76,7 @@ def set_seed(seed: int) -> None:
 def safe_clear_tf() -> None:
     if TF_AVAILABLE:
         tf.keras.backend.clear_session()
+    gc.collect()
 
 
 def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -1722,6 +1726,791 @@ def run_pipeline(cfg: ExperimentConfig, repo_root: Path) -> Path:
     return out_root
 
 
+
+# -----------------------------------------------------------------------------
+# Parallel task execution, incremental checkpoints, and final aggregation
+# -----------------------------------------------------------------------------
+
+
+def atomic_save_csv(df: pd.DataFrame, path: Path) -> None:
+    """Write a CSV atomically so an interrupted write is never a valid checkpoint."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    df.to_csv(tmp, index=False)
+    os.replace(tmp, path)
+
+
+def atomic_save_json(obj: Any, path: Path) -> None:
+    """Write JSON atomically so stage markers are committed only after success."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False, default=str)
+    os.replace(tmp, path)
+
+
+def read_csv_if_present(path: Path) -> pd.DataFrame:
+    if not path.exists() or path.stat().st_size == 0:
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+
+
+def concat_nonempty(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
+    valid = [x for x in frames if x is not None and not x.empty]
+    return pd.concat(valid, ignore_index=True) if valid else pd.DataFrame()
+
+
+def task_directory(out_root: Path, task_index: int, task: str) -> Path:
+    return out_root / "tasks" / f"{task_index:02d}_{safe_slug(task)}"
+
+
+def execution_signature(cfg: ExperimentConfig, dcfg: DatasetConfig) -> Tuple[str, Dict[str, Any]]:
+    payload = {
+        "experiment_config": asdict(cfg),
+        "dataset_config": asdict(dcfg),
+        "model_registry": MODEL_REGISTRY,
+        "task_order": TASK_ORDER,
+        "model_order": MODEL_ORDER,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest(), payload
+
+
+class PersistentFitProgress(FitProgress):
+    """Fit progress that also appends each completed fit event to disk immediately."""
+
+    def __init__(self, log_path: Path):
+        super().__init__()
+        self.log_path = log_path
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def step(self, msg: str):
+        super().step(msg)
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"fit": self.done, "message": msg}, ensure_ascii=False) + "\n")
+            f.flush()
+
+
+def persistent_log_dataframe(path: Path, task: str) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
+            for run_line, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                row["task"] = task
+                row["run_line"] = run_line
+                rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def ensure_task_configuration(task_dir: Path, cfg: ExperimentConfig, dcfg: DatasetConfig) -> str:
+    signature, payload = execution_signature(cfg, dcfg)
+    meta_path = task_dir / "task_config.json"
+    if meta_path.exists():
+        with open(meta_path, "r", encoding="utf-8") as f:
+            previous = json.load(f)
+        previous_signature = previous.get("signature")
+        if previous_signature != signature:
+            raise RuntimeError(
+                f"Checkpoint configuration mismatch in {task_dir}. "
+                "Use --restart-task for this task or choose a different --output-root."
+            )
+    else:
+        atomic_save_json({"signature": signature, "payload": payload}, meta_path)
+    return signature
+
+
+def run_nested_cv_checkpointed(
+    X: np.ndarray,
+    y: np.ndarray,
+    cfg: ExperimentConfig,
+    task: str,
+    progress: FitProgress,
+    task_dir: Path,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Run the original nested-CV calculation with one checkpoint per outer-fold/model family."""
+    parts_dir = task_dir / "parts" / "nested"
+    state_dir = task_dir / "state"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    outer_splits = list(KFold(n_splits=cfg.outer_folds, shuffle=True, random_state=42).split(X))
+    families = active_families(cfg)
+
+    raw_parts: List[pd.DataFrame] = []
+    pred_parts: List[pd.DataFrame] = []
+    candidate_parts: List[pd.DataFrame] = []
+
+    for outer_fold, (tr, te) in enumerate(outer_splits, 1):
+        for family in families:
+            stem = f"outer_{outer_fold:02d}_{safe_slug(family)}"
+            raw_path = parts_dir / f"{stem}_raw.csv"
+            pred_path = parts_dir / f"{stem}_predictions.csv"
+            cand_path = parts_dir / f"{stem}_candidates.csv"
+            done_path = state_dir / f"nested_{stem}.done.json"
+
+            if done_path.exists() and raw_path.exists() and pred_path.exists() and cand_path.exists():
+                print(f"[RESUME] {task} | nested outer={outer_fold} | {family}")
+                raw_parts.append(read_csv_if_present(raw_path))
+                pred_parts.append(read_csv_if_present(pred_path))
+                candidate_parts.append(read_csv_if_present(cand_path))
+                continue
+
+            best, inner_score, rows = select_best_config(
+                family,
+                X[tr],
+                y[tr],
+                cfg,
+                seed=100 + outer_fold,
+                task=task,
+                stage=f"NESTED_OUTER_{outer_fold}_SELECT",
+                progress=progress,
+            )
+            for row in rows:
+                row["outer_fold"] = outer_fold
+
+            metrics, predictions = evaluate_selected_model(
+                family,
+                best,
+                X[tr],
+                y[tr],
+                X[te],
+                y[te],
+                np.asarray(te),
+                cfg,
+                task,
+                stage=f"NESTED_OUTER_{outer_fold}_TEST",
+                progress=progress,
+            )
+            rmse_values = metrics["rmse"].astype(float).values
+            r2_values = metrics["r2"].astype(float).values
+            raw = pd.DataFrame([
+                {
+                    "task": task,
+                    "outer_fold": outer_fold,
+                    "family": family,
+                    "inner_cv_rmse": inner_score,
+                    "best_config": str(best),
+                    "test_rmse_mean": float(np.mean(rmse_values)),
+                    "test_rmse_median": float(np.median(rmse_values)),
+                    "test_rmse_sd_across_seeds": sample_std(rmse_values),
+                    "test_r2_mean": float(np.mean(r2_values)),
+                    "test_r2_median": float(np.median(r2_values)),
+                    "test_r2_sd_across_seeds": sample_std(r2_values),
+                    "n_test": int(len(te)),
+                    "n_final_seeds": int(len(metrics)),
+                }
+            ])
+            predictions = predictions.copy()
+            predictions["outer_fold"] = outer_fold
+            candidates = pd.DataFrame(rows)
+
+            atomic_save_csv(raw, raw_path)
+            atomic_save_csv(predictions, pred_path)
+            atomic_save_csv(candidates, cand_path)
+            atomic_save_json(
+                {"task": task, "outer_fold": outer_fold, "family": family, "complete": True},
+                done_path,
+            )
+            print(f"[CHECKPOINT] {task} | nested outer={outer_fold} | {family}")
+            raw_parts.append(raw)
+            pred_parts.append(predictions)
+            candidate_parts.append(candidates)
+            safe_clear_tf()
+
+    raw_df = concat_nonempty(raw_parts)
+    pred_df = concat_nonempty(pred_parts)
+    candidate_df = concat_nonempty(candidate_parts)
+    atomic_save_csv(raw_df, task_dir / "nested_cv_raw.csv")
+    atomic_save_csv(pred_df, task_dir / "nested_cv_predictions.csv")
+    atomic_save_csv(candidate_df, task_dir / "nested_cv_candidates.csv")
+    atomic_save_csv(summarize_nested_cv(raw_df), task_dir / "nested_cv_summary.csv")
+    atomic_save_json({"complete": True}, state_dir / "nested_complete.json")
+    return raw_df, pred_df, candidate_df
+
+
+def summarize_independent_test_parts(
+    task: str,
+    dev_idx: np.ndarray,
+    test_idx: np.ndarray,
+    seed_metrics: pd.DataFrame,
+    predictions: pd.DataFrame,
+    best_map: Dict[str, Dict[str, Any]],
+    families: Sequence[str],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    pred_agg = aggregate_test_predictions(predictions)
+    summary_rows: List[Dict[str, Any]] = []
+    for family in families:
+        g = seed_metrics[seed_metrics["family"] == family]
+        pg = pred_agg[pred_agg["family"] == family]
+        if g.empty or pg.empty:
+            continue
+        rmse_seed = g["rmse"].astype(float).values
+        r2_seed = g["r2"].astype(float).values
+        y_true = pg["y_true"].astype(float).values
+        y_pred_mean = pg["y_pred_mean"].astype(float).values
+        rmsep_pooled = float(np.sqrt(pg["squared_error_mean_across_seeds"].astype(float).mean()))
+        summary_rows.append(
+            {
+                "task": task,
+                "family": family,
+                "n_development": int(len(dev_idx)),
+                "n_test": int(len(test_idx)),
+                "inner_cv_rmse_selected": float(g["inner_cv_rmse"].iloc[0]),
+                "rmsep_pooled": rmsep_pooled,
+                "rmsep_mean_prediction": rmse(y_true, y_pred_mean),
+                "rmsep_seed_mean": float(np.mean(rmse_seed)),
+                "rmsep_seed_median": float(np.median(rmse_seed)),
+                "rmsep_seed_sd": sample_std(rmse_seed),
+                "r2_mean_prediction": float(r2_score(y_true, y_pred_mean)),
+                "r2_seed_mean": float(np.mean(r2_seed)),
+                "r2_seed_median": float(np.median(r2_seed)),
+                "r2_seed_sd": sample_std(r2_seed),
+                "n_seeds": int(len(g)),
+                "best_config": str(best_map[family]),
+            }
+        )
+    return reorder_models(pd.DataFrame(summary_rows)), pred_agg
+
+
+def run_independent_test_checkpointed(
+    X: np.ndarray,
+    y: np.ndarray,
+    cfg: ExperimentConfig,
+    task: str,
+    progress: FitProgress,
+    task_dir: Path,
+) -> Tuple[
+    pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame,
+    Dict[str, Dict[str, Any]], np.ndarray, np.ndarray, pd.DataFrame,
+]:
+    """Run independent-test selection/evaluation with one checkpoint per model family."""
+    parts_dir = task_dir / "parts" / "holdout"
+    state_dir = task_dir / "state"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    dev_idx, test_idx = make_locked_holdout_split(len(X), cfg.holdout_fraction, cfg.holdout_seed)
+    X_dev, y_dev = X[dev_idx], y[dev_idx]
+    X_test, y_test = X[test_idx], y[test_idx]
+    split_df = pd.DataFrame(
+        [{"task": task, "sample_index": int(i), "split": "development"} for i in dev_idx]
+        + [{"task": task, "sample_index": int(i), "split": "locked_test"} for i in test_idx]
+    )
+    atomic_save_csv(split_df, task_dir / "split_manifest.csv")
+
+    families = active_families(cfg)
+    metric_parts: List[pd.DataFrame] = []
+    pred_parts: List[pd.DataFrame] = []
+    candidate_parts: List[pd.DataFrame] = []
+    best_map: Dict[str, Dict[str, Any]] = {}
+
+    for family in families:
+        stem = safe_slug(family)
+        metrics_path = parts_dir / f"{stem}_seed_metrics.csv"
+        pred_path = parts_dir / f"{stem}_predictions.csv"
+        cand_path = parts_dir / f"{stem}_candidates.csv"
+        best_path = parts_dir / f"{stem}_best.json"
+        done_path = state_dir / f"holdout_{stem}.done.json"
+
+        if all(x.exists() for x in [metrics_path, pred_path, cand_path, best_path, done_path]):
+            print(f"[RESUME] {task} | independent test | {family}")
+            metrics = read_csv_if_present(metrics_path)
+            predictions = read_csv_if_present(pred_path)
+            candidates = read_csv_if_present(cand_path)
+            with open(best_path, "r", encoding="utf-8") as f:
+                best = json.load(f)["best_config"]
+        else:
+            best, inner_score, rows = select_best_config(
+                family,
+                X_dev,
+                y_dev,
+                cfg,
+                seed=cfg.holdout_seed + 17,
+                task=task,
+                stage="HOLDOUT_SELECT",
+                progress=progress,
+            )
+            metrics, predictions = evaluate_selected_model(
+                family,
+                best,
+                X_dev,
+                y_dev,
+                X_test,
+                y_test,
+                test_idx,
+                cfg,
+                task,
+                stage="LOCKED_TEST",
+                progress=progress,
+            )
+            metrics = metrics.copy()
+            metrics["inner_cv_rmse"] = inner_score
+            candidates = pd.DataFrame(rows)
+            atomic_save_csv(metrics, metrics_path)
+            atomic_save_csv(predictions, pred_path)
+            atomic_save_csv(candidates, cand_path)
+            atomic_save_json({"best_config": best, "inner_cv_rmse": inner_score}, best_path)
+            atomic_save_json({"task": task, "family": family, "complete": True}, done_path)
+            print(f"[CHECKPOINT] {task} | independent test | {family}")
+            safe_clear_tf()
+
+        best_map[family] = dict(best)
+        metric_parts.append(metrics)
+        pred_parts.append(predictions)
+        candidate_parts.append(candidates)
+
+    seed_metrics = concat_nonempty(metric_parts)
+    predictions = concat_nonempty(pred_parts)
+    candidates = concat_nonempty(candidate_parts)
+    summary, pred_agg = summarize_independent_test_parts(
+        task, dev_idx, test_idx, seed_metrics, predictions, best_map, families
+    )
+
+    atomic_save_csv(summary, task_dir / "independent_test_summary.csv")
+    atomic_save_csv(seed_metrics, task_dir / "independent_test_seed_metrics.csv")
+    atomic_save_csv(predictions, task_dir / "independent_test_predictions.csv")
+    atomic_save_csv(pred_agg, task_dir / "independent_test_predictions_aggregated.csv")
+    atomic_save_csv(candidates, task_dir / "independent_test_candidates.csv")
+    atomic_save_json(best_map, task_dir / "best_map.json")
+    atomic_save_json({"complete": True}, state_dir / "holdout_complete.json")
+    return summary, seed_metrics, predictions, pred_agg, best_map, dev_idx, test_idx, candidates
+
+
+def summarize_test_learning_curve(raw: pd.DataFrame) -> pd.DataFrame:
+    if raw.empty:
+        return pd.DataFrame()
+    agg = (
+        raw.groupby(["task", "family", "point", "train_n", "train_fraction_of_development"], as_index=False)
+        .agg(
+            test_rmse_mean=("test_rmse", "mean"),
+            test_rmse_std=("test_rmse", "std"),
+            test_r2_mean=("test_r2", "mean"),
+            test_r2_std=("test_r2", "std"),
+        )
+    )
+    agg[["test_rmse_std", "test_r2_std"]] = agg[["test_rmse_std", "test_r2_std"]].fillna(0.0)
+    return reorder_models(reorder_tasks(agg))
+
+
+def run_test_learning_curve_checkpointed(
+    X: np.ndarray,
+    y: np.ndarray,
+    dev_idx: np.ndarray,
+    test_idx: np.ndarray,
+    best_map: Dict[str, Dict[str, Any]],
+    cfg: ExperimentConfig,
+    task: str,
+    progress: FitProgress,
+    task_dir: Path,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if not cfg.run_learning_curves:
+        raw = pd.DataFrame()
+        agg = pd.DataFrame()
+        atomic_save_csv(raw, task_dir / "learning_curve_independent_test_raw.csv")
+        atomic_save_csv(agg, task_dir / "learning_curve_independent_test_summary.csv")
+        return raw, agg
+
+    parts_dir = task_dir / "parts" / "lc_locked"
+    state_dir = task_dir / "state"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    X_dev, y_dev = X[dev_idx], y[dev_idx]
+    X_test, y_test = X[test_idx], y[test_idx]
+    sizes = learning_curve_sizes(len(dev_idx), cfg.learning_curve_points)
+    families = [f for f in cfg.learning_curve_families if f in best_map and f in active_families(cfg)]
+    parts: List[pd.DataFrame] = []
+
+    for family in families:
+        cand = best_map[family]
+        for repeat in range(cfg.learning_curve_repeats):
+            rng = np.random.default_rng(cfg.learning_curve_seed + repeat + 101 * TASK_ORDER.index(task))
+            order = rng.permutation(len(dev_idx))
+            for point, train_n in enumerate(sizes, 1):
+                stem = f"{safe_slug(family)}_r{repeat:02d}_p{point:02d}"
+                part_path = parts_dir / f"{stem}.csv"
+                done_path = state_dir / f"lc_locked_{stem}.done.json"
+                if part_path.exists() and done_path.exists():
+                    print(f"[RESUME] {task} | locked LC | {family} | repeat={repeat} | point={point}")
+                    parts.append(read_csv_if_present(part_path))
+                    continue
+
+                sub = order[:train_n]
+                seed = cfg.learning_curve_seed + 1000 * repeat + point
+                metrics, _ = evaluate_selected_model(
+                    family,
+                    cand,
+                    X_dev[sub],
+                    y_dev[sub],
+                    X_test,
+                    y_test,
+                    test_idx,
+                    cfg,
+                    task,
+                    stage="LC_LOCKED_TEST",
+                    progress=progress,
+                    seed_override=[seed] if is_dl_family(family) else None,
+                )
+                row = pd.DataFrame([
+                    {
+                        "task": task,
+                        "family": family,
+                        "point": point,
+                        "train_n": int(train_n),
+                        "train_fraction_of_development": float(train_n / len(dev_idx)),
+                        "repeat": repeat,
+                        "test_rmse": float(metrics["rmse"].mean()),
+                        "test_r2": float(metrics["r2"].mean()),
+                        "fixed_best_config": str(cand),
+                    }
+                ])
+                atomic_save_csv(row, part_path)
+                atomic_save_json({"complete": True}, done_path)
+                print(f"[CHECKPOINT] {task} | locked LC | {family} | repeat={repeat} | point={point}")
+                parts.append(row)
+                safe_clear_tf()
+
+    raw = concat_nonempty(parts)
+    agg = summarize_test_learning_curve(raw)
+    atomic_save_csv(raw, task_dir / "learning_curve_independent_test_raw.csv")
+    atomic_save_csv(agg, task_dir / "learning_curve_independent_test_summary.csv")
+    atomic_save_json({"complete": True}, state_dir / "lc_locked_complete.json")
+    return raw, agg
+
+
+def summarize_cv_learning_curve(raw: pd.DataFrame) -> pd.DataFrame:
+    if raw.empty:
+        return pd.DataFrame()
+    agg = (
+        raw.groupby(["task", "family", "point", "train_n"], as_index=False)
+        .agg(
+            train_rmse_mean=("train_rmse", "mean"),
+            train_rmse_std=("train_rmse", "std"),
+            cv_rmse_mean=("cv_rmse", "mean"),
+            cv_rmse_std=("cv_rmse", "std"),
+        )
+    )
+    agg[["train_rmse_std", "cv_rmse_std"]] = agg[["train_rmse_std", "cv_rmse_std"]].fillna(0.0)
+    return reorder_models(reorder_tasks(agg))
+
+
+def run_cv_learning_curve_checkpointed(
+    X: np.ndarray,
+    y: np.ndarray,
+    dev_idx: np.ndarray,
+    best_map: Dict[str, Dict[str, Any]],
+    cfg: ExperimentConfig,
+    task: str,
+    progress: FitProgress,
+    task_dir: Path,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if not cfg.run_learning_curves:
+        raw = pd.DataFrame()
+        agg = pd.DataFrame()
+        atomic_save_csv(raw, task_dir / "learning_curve_cv_diagnostic_raw.csv")
+        atomic_save_csv(agg, task_dir / "learning_curve_cv_diagnostic_summary.csv")
+        return raw, agg
+
+    parts_dir = task_dir / "parts" / "lc_cv"
+    state_dir = task_dir / "state"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    X_dev, y_dev = X[dev_idx], y[dev_idx]
+    sizes = learning_curve_sizes(len(dev_idx), cfg.learning_curve_points)
+    families = [f for f in cfg.learning_curve_families if f in best_map and f in active_families(cfg)]
+    parts: List[pd.DataFrame] = []
+
+    for family in families:
+        cand = best_map[family]
+        for repeat in range(cfg.learning_curve_repeats):
+            rng = np.random.default_rng(cfg.learning_curve_seed + 500 + repeat + 101 * TASK_ORDER.index(task))
+            order = rng.permutation(len(dev_idx))
+            for point, train_n in enumerate(sizes, 1):
+                stem = f"{safe_slug(family)}_r{repeat:02d}_p{point:02d}"
+                part_path = parts_dir / f"{stem}.csv"
+                done_path = state_dir / f"lc_cv_{stem}.done.json"
+                if part_path.exists() and done_path.exists():
+                    print(f"[RESUME] {task} | CV LC | {family} | repeat={repeat} | point={point}")
+                    parts.append(read_csv_if_present(part_path))
+                    continue
+
+                sub = order[:train_n]
+                X_sub, y_sub = X_dev[sub], y_dev[sub]
+                splits = kfold_splits(
+                    len(sub), cfg.learning_curve_cv_folds, cfg.learning_curve_seed + point + repeat
+                )
+                if not candidate_valid_for_splits(family, cand, splits, X_sub.shape[1]):
+                    atomic_save_csv(pd.DataFrame(), part_path)
+                    atomic_save_json({"complete": True, "skipped": True}, done_path)
+                    continue
+
+                rows: List[Dict[str, Any]] = []
+                for fold, (tr, va) in enumerate(splits, 1):
+                    seed = cfg.learning_curve_seed + 1000 * repeat + 100 * point + fold
+                    tr_pred, va_pred = fit_predict_direct_for_cv_curve(
+                        family,
+                        cand,
+                        X_sub[tr],
+                        y_sub[tr],
+                        X_sub[va],
+                        y_sub[va],
+                        cfg,
+                        seed,
+                        task,
+                        progress,
+                    )
+                    rows.append(
+                        {
+                            "task": task,
+                            "family": family,
+                            "point": point,
+                            "train_n": int(train_n),
+                            "repeat": repeat,
+                            "fold": fold,
+                            "train_rmse": rmse(y_sub[tr], tr_pred),
+                            "cv_rmse": rmse(y_sub[va], va_pred),
+                            "fixed_best_config": str(cand),
+                        }
+                    )
+                part = pd.DataFrame(rows)
+                atomic_save_csv(part, part_path)
+                atomic_save_json({"complete": True}, done_path)
+                print(f"[CHECKPOINT] {task} | CV LC | {family} | repeat={repeat} | point={point}")
+                parts.append(part)
+                safe_clear_tf()
+
+    raw = concat_nonempty(parts)
+    agg = summarize_cv_learning_curve(raw)
+    atomic_save_csv(raw, task_dir / "learning_curve_cv_diagnostic_raw.csv")
+    atomic_save_csv(agg, task_dir / "learning_curve_cv_diagnostic_summary.csv")
+    atomic_save_json({"complete": True}, state_dir / "lc_cv_complete.json")
+    return raw, agg
+
+
+def run_single_task(
+    cfg: ExperimentConfig,
+    repo_root: Path,
+    task_index: int,
+    restart_task: bool = False,
+) -> Path:
+    """Run exactly one manuscript task in an isolated process with automatic resume."""
+    if cfg.smoke_test:
+        apply_smoke_profile(cfg)
+    active_families(cfg)
+    datasets = manuscript_datasets()
+    if task_index < 0 or task_index >= len(datasets):
+        raise ValueError(f"--task-index must be between 0 and {len(datasets) - 1}.")
+
+    dcfg = datasets[task_index]
+    out_root = repo_root / cfg.output_root
+    task_dir = task_directory(out_root, task_index, dcfg.task)
+    if restart_task and task_dir.exists():
+        shutil.rmtree(task_dir)
+    task_dir.mkdir(parents=True, exist_ok=True)
+    signature = ensure_task_configuration(task_dir, cfg, dcfg)
+    done_path = task_dir / "DONE.json"
+    if done_path.exists():
+        print(f"[RESUME] TASK ALREADY COMPLETE: {dcfg.task}")
+        return task_dir
+
+    progress = PersistentFitProgress(task_dir / "run_log.jsonl")
+    print(f"\n=== TASK {task_index}/8: {dcfg.task} ===")
+    if cfg.synthetic:
+        X, y = synthetic_dataset(dcfg, seed=10000 + task_index + 1)
+    else:
+        X, y = load_dataset(dcfg, repo_root)
+
+    audit = pd.DataFrame([audit_dataset(X, y, dcfg, synthetic=cfg.synthetic)])
+    atomic_save_csv(audit, task_dir / "dataset_audit.csv")
+    print(f"[CHECKPOINT] {dcfg.task} | dataset audit")
+
+    nested_raw, nested_pred, nested_candidates = run_nested_cv_checkpointed(
+        X, y, cfg, dcfg.task, progress, task_dir
+    )
+    (
+        holdout_summary,
+        holdout_seed,
+        holdout_pred,
+        holdout_pred_agg,
+        best_map,
+        dev_idx,
+        test_idx,
+        holdout_candidates,
+    ) = run_independent_test_checkpointed(X, y, cfg, dcfg.task, progress, task_dir)
+
+    lc_test_raw, lc_test_agg = run_test_learning_curve_checkpointed(
+        X, y, dev_idx, test_idx, best_map, cfg, dcfg.task, progress, task_dir
+    )
+    lc_cv_raw, lc_cv_agg = run_cv_learning_curve_checkpointed(
+        X, y, dev_idx, best_map, cfg, dcfg.task, progress, task_dir
+    )
+
+    atomic_save_csv(persistent_log_dataframe(task_dir / "run_log.jsonl", dcfg.task), task_dir / "run_log.csv")
+    atomic_save_json(
+        {
+            "complete": True,
+            "task_index": task_index,
+            "task": dcfg.task,
+            "signature": signature,
+            "rows": {
+                "nested_cv_raw": int(len(nested_raw)),
+                "nested_cv_predictions": int(len(nested_pred)),
+                "nested_cv_candidates": int(len(nested_candidates)),
+                "independent_test_summary": int(len(holdout_summary)),
+                "independent_test_seed_metrics": int(len(holdout_seed)),
+                "independent_test_predictions": int(len(holdout_pred)),
+                "independent_test_predictions_aggregated": int(len(holdout_pred_agg)),
+                "independent_test_candidates": int(len(holdout_candidates)),
+                "learning_curve_independent_test_raw": int(len(lc_test_raw)),
+                "learning_curve_cv_diagnostic_raw": int(len(lc_cv_raw)),
+            },
+        },
+        done_path,
+    )
+    safe_clear_tf()
+    gc.collect()
+    print(f"TASK COMPLETE: {dcfg.task}")
+    return task_dir
+
+
+def aggregate_parallel_outputs(cfg: ExperimentConfig, repo_root: Path) -> Path:
+    """Combine nine completed task directories and generate the original final output package."""
+    if cfg.smoke_test:
+        apply_smoke_profile(cfg)
+    out_root = repo_root / cfg.output_root
+    raw_dir = out_root / "raw"
+    tables_dir = out_root / "tables"
+    figures_dir = out_root / "figures"
+    latex_dir = out_root / "latex"
+    for d in [raw_dir, tables_dir, figures_dir, latex_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    datasets = manuscript_datasets()
+    task_dirs = [task_directory(out_root, i, d.task) for i, d in enumerate(datasets)]
+    missing = [str(td) for td in task_dirs if not (td / "DONE.json").exists()]
+    if missing:
+        raise RuntimeError(
+            "Aggregation requires all nine tasks to be complete. Missing DONE.json for:\n- "
+            + "\n- ".join(missing)
+        )
+
+    audit_df = reorder_tasks(concat_nonempty([read_csv_if_present(td / "dataset_audit.csv") for td in task_dirs]))
+    split_df = reorder_tasks(concat_nonempty([read_csv_if_present(td / "split_manifest.csv") for td in task_dirs]))
+    nested_raw_df = concat_nonempty([read_csv_if_present(td / "nested_cv_raw.csv") for td in task_dirs])
+    nested_predictions_df = concat_nonempty([read_csv_if_present(td / "nested_cv_predictions.csv") for td in task_dirs])
+    nested_candidates_df = concat_nonempty([read_csv_if_present(td / "nested_cv_candidates.csv") for td in task_dirs])
+    holdout_summary_df = reorder_models(reorder_tasks(concat_nonempty([read_csv_if_present(td / "independent_test_summary.csv") for td in task_dirs])))
+    holdout_seed_df = concat_nonempty([read_csv_if_present(td / "independent_test_seed_metrics.csv") for td in task_dirs])
+    holdout_predictions_df = concat_nonempty([read_csv_if_present(td / "independent_test_predictions.csv") for td in task_dirs])
+    holdout_pred_agg_df = concat_nonempty([read_csv_if_present(td / "independent_test_predictions_aggregated.csv") for td in task_dirs])
+    holdout_candidates_df = concat_nonempty([read_csv_if_present(td / "independent_test_candidates.csv") for td in task_dirs])
+    lc_test_raw_df = concat_nonempty([read_csv_if_present(td / "learning_curve_independent_test_raw.csv") for td in task_dirs])
+    lc_test_agg_df = concat_nonempty([read_csv_if_present(td / "learning_curve_independent_test_summary.csv") for td in task_dirs])
+    lc_cv_raw_df = concat_nonempty([read_csv_if_present(td / "learning_curve_cv_diagnostic_raw.csv") for td in task_dirs])
+    lc_cv_agg_df = concat_nonempty([read_csv_if_present(td / "learning_curve_cv_diagnostic_summary.csv") for td in task_dirs])
+    run_log_df = concat_nonempty([persistent_log_dataframe(td / "run_log.jsonl", d.task) for td, d in zip(task_dirs, datasets)])
+
+    nested_summary_df = summarize_nested_cv(nested_raw_df)
+    vdvt_df = van_der_voet_table(
+        holdout_pred_agg_df,
+        trials=cfg.randomization_trials,
+        seed=cfg.randomization_seed,
+    )
+    nested_ranks_df, nested_rank_counts_df = numerical_rank_summary(nested_summary_df, "rmse_mean")
+    holdout_ranks_df, holdout_rank_counts_df = numerical_rank_summary(holdout_summary_df, "rmsep_pooled")
+
+    complexity_df = pd.DataFrame()
+    if not nested_candidates_df.empty:
+        cg = nested_candidates_df[
+            (nested_candidates_df["family"].isin(["ANN", "CNN1D"]))
+            & (nested_candidates_df["status"] == "evaluated")
+        ].copy()
+        if not cg.empty:
+            complexity_df = (
+                cg.groupby(["task", "family", "candidate", "param_count", "approx_flops"], as_index=False)
+                .agg(
+                    inner_cv_rmse_mean=("inner_cv_rmse", "mean"),
+                    inner_cv_rmse_std=("inner_cv_rmse", "std"),
+                    evaluations=("inner_cv_rmse", "count"),
+                )
+            )
+            complexity_df["inner_cv_rmse_std"] = complexity_df["inner_cv_rmse_std"].fillna(0.0)
+            complexity_df = reorder_models(reorder_tasks(complexity_df))
+
+    raw_outputs = {
+        "dataset_audit.csv": audit_df,
+        "split_manifest.csv": split_df,
+        "nested_cv_raw.csv": nested_raw_df,
+        "nested_cv_summary.csv": nested_summary_df,
+        "nested_cv_predictions.csv": nested_predictions_df,
+        "nested_cv_candidates.csv": nested_candidates_df,
+        "independent_test_summary.csv": holdout_summary_df,
+        "independent_test_seed_metrics.csv": holdout_seed_df,
+        "independent_test_predictions.csv": holdout_predictions_df,
+        "independent_test_predictions_aggregated.csv": holdout_pred_agg_df,
+        "independent_test_candidates.csv": holdout_candidates_df,
+        "van_der_voet_randomization.csv": vdvt_df,
+        "nested_cv_task_ranks.csv": nested_ranks_df,
+        "nested_cv_rank_summary.csv": nested_rank_counts_df,
+        "independent_test_task_ranks.csv": holdout_ranks_df,
+        "independent_test_rank_summary.csv": holdout_rank_counts_df,
+        "learning_curve_independent_test_raw.csv": lc_test_raw_df,
+        "learning_curve_independent_test_summary.csv": lc_test_agg_df,
+        "learning_curve_cv_diagnostic_raw.csv": lc_cv_raw_df,
+        "learning_curve_cv_diagnostic_summary.csv": lc_cv_agg_df,
+        "dl_complexity.csv": complexity_df,
+        "run_log.csv": run_log_df,
+    }
+    for name, df in raw_outputs.items():
+        atomic_save_csv(df, raw_dir / name)
+
+    save_excel_workbook(
+        tables_dir / "revision_tables.xlsx",
+        {
+            "Dataset_Audit": audit_df,
+            "Nested_CV_Summary": nested_summary_df,
+            "Independent_Test": holdout_summary_df,
+            "Van_der_Voet": vdvt_df,
+            "Nested_Ranks": nested_rank_counts_df,
+            "Independent_Ranks": holdout_rank_counts_df,
+            "LC_Independent_Test": lc_test_agg_df,
+            "LC_CV_Diagnostic": lc_cv_agg_df,
+            "DL_Complexity": complexity_df,
+        },
+    )
+    latex_text = build_latex_bundle(
+        audit_df, nested_summary_df, holdout_summary_df, holdout_rank_counts_df, vdvt_df
+    )
+    latex_dir.mkdir(parents=True, exist_ok=True)
+    (latex_dir / "latex_tables.txt").write_text(latex_text, encoding="utf-8")
+
+    for task in TASK_ORDER:
+        plot_task_benchmark(task, nested_summary_df, figures_dir)
+    plot_global_complexity(nested_candidates_df, figures_dir)
+    plot_global_test_learning_curve(lc_test_agg_df, figures_dir)
+    plot_global_cv_learning_curve(lc_cv_agg_df, figures_dir)
+
+    run_config = asdict(cfg)
+    run_config.update(
+        {
+            "tensorflow_available": TF_AVAILABLE,
+            "active_families": active_families(cfg),
+            "dataset_tasks": TASK_ORDER,
+            "data_configs": [asdict(x) for x in datasets],
+            "execution_mode": "parallel_task_array_with_incremental_checkpoints",
+        }
+    )
+    atomic_save_json(run_config, out_root / "run_config.json")
+    atomic_save_json({"complete": True, "tasks": TASK_ORDER}, out_root / "AGGREGATION_DONE.json")
+    print(f"\nAggregation complete. Outputs written to: {out_root}")
+    return out_root
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Food NIR spectroscopy regression benchmark")
     p.add_argument("--synthetic", action="store_true", help="Use generated spectroscopy-like data instead of local data files.")
@@ -1732,6 +2521,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--holdout-seed", type=int, default=2026, help="Random seed for the locked independent split.")
     p.add_argument("--randomization-trials", type=int, default=9999, help="Monte Carlo trials for paired randomization tests.")
     p.add_argument("--output-root", type=str, default="outputs/revision_results", help="Output directory relative to repository root.")
+    p.add_argument("--task-index", type=int, default=None, help="Run one manuscript task (0-8) for SLURM job-array execution.")
+    p.add_argument("--aggregate", action="store_true", help="Aggregate completed task outputs into final CSV/Excel/LaTeX/figure outputs.")
+    p.add_argument("--restart-task", action="store_true", help="Delete checkpoints for the selected task before starting it again.")
     return p.parse_args()
 
 
@@ -1750,7 +2542,14 @@ def main() -> None:
         run_learning_curves=not args.skip_learning_curves,
     )
     repo_root = Path(__file__).resolve().parent
-    run_pipeline(cfg, repo_root)
+    if args.aggregate:
+        if args.task_index is not None:
+            raise ValueError("Use either --aggregate or --task-index, not both.")
+        aggregate_parallel_outputs(cfg, repo_root)
+    elif args.task_index is not None:
+        run_single_task(cfg, repo_root, args.task_index, restart_task=args.restart_task)
+    else:
+        run_pipeline(cfg, repo_root)
 
 
 if __name__ == "__main__":
